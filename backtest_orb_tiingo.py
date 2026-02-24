@@ -265,13 +265,17 @@ def fetch_tiingo_iex_5m(ticker: str, start_date: date_type, end_date: date_type)
     if "time_str" not in df.columns:
         return None, "iex_no_date_col"
 
+    # IEX 5min resampled data does NOT include volume — add synthetic v=1
+    if "v" not in df.columns:
+        df["v"] = 1.0
+
     df["time"] = pd.to_datetime(df["time_str"], utc=True)
     df["ts"]   = df["time"].astype("int64") // 10**6
     df = df[["o", "h", "l", "c", "v", "time", "ts"]].copy()
     df = df.dropna(subset=["o", "h", "l", "c"])
     df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
-    # Drop zero-volume bars (non-trading)
-    df = df[df["v"] > 0].reset_index(drop=True)
+    # Drop bars where OHLC are all zero (non-trading)
+    df = df[(df["o"] > 0) | (df["c"] > 0)].reset_index(drop=True)
     return df, "tiingo_iex"
 
 
@@ -313,17 +317,28 @@ def fetch_tiingo_crypto_5m(ticker: str, start_date: date_type, end_date: date_ty
 
     df = pd.DataFrame(all_rows)
     col_map = {"date": "time_str", "open": "o", "high": "h", "low": "l",
-               "close": "c", "volume": "v"}
+               "close": "c", "volume": "v",
+               "tradesDone": "v_trades",
+               "volumeNotional": "v_notional"}
     df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
     if "time_str" not in df.columns:
         return None, "crypto_no_date_col"
+
+    # Crypto endpoint: volume may be named differently
+    if "v" not in df.columns:
+        if "v_notional" in df.columns:
+            df["v"] = df["v_notional"]
+        elif "v_trades" in df.columns:
+            df["v"] = df["v_trades"]
+        else:
+            df["v"] = 1.0
 
     df["time"] = pd.to_datetime(df["time_str"], utc=True)
     df["ts"]   = df["time"].astype("int64") // 10**6
     df = df[["o", "h", "l", "c", "v", "time", "ts"]].copy()
     df = df.dropna(subset=["o", "h", "l", "c"])
     df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
-    df = df[df["v"] > 0].reset_index(drop=True)
+    df = df[(df["o"] > 0) | (df["c"] > 0)].reset_index(drop=True)
     return df, "tiingo_crypto"
 
 
@@ -505,9 +520,84 @@ def load_daily_cache(label: str):
         return None, None, None
 
 # ====================================================================
+# DAILY VOLUME — fetch from Tiingo Daily endpoint (IEX stocks only)
+# ====================================================================
+def _cache_daily_vol_path(label: str) -> Path:
+    return CACHE_DIR / f"{label}_daily_vol.json"
+
+def save_daily_vol_cache(label: str, vol_map: dict):
+    """Save {date_str: (volume, vol_ma20)} to JSON."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = _cache_daily_vol_path(label)
+    obj = {str(k): list(v) for k, v in vol_map.items()}
+    with open(path, "w") as f:
+        json.dump(obj, f)
+
+def load_daily_vol_cache(label: str) -> Optional[dict]:
+    """Load daily volume cache. Returns {date: (volume, vol_ma20)} or None."""
+    path = _cache_daily_vol_path(label)
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            obj = json.load(f)
+        vol_map = {}
+        for k, v in obj.items():
+            d = date_type.fromisoformat(k)
+            vol_map[d] = (v[0], v[1])
+        return vol_map
+    except Exception:
+        return None
+
+def fetch_tiingo_daily_volume(ticker: str, start_date: date_type, end_date: date_type,
+                              ma_period: int = 20) -> dict:
+    """
+    Fetch daily OHLCV from Tiingo daily endpoint (single API call for full range).
+    Returns {date: (volume, vol_ma20)} dict.
+    The daily endpoint has real volume data even though IEX 5min does not.
+    """
+    url = f"{TIINGO_BASE}/tiingo/daily/{ticker}/prices"
+    # Add buffer before start_date for MA warmup
+    warmup_start = start_date - timedelta(days=ma_period * 2 + 30)
+    params = {
+        "startDate": warmup_start.isoformat(),
+        "endDate":   end_date.isoformat(),
+    }
+    print(f" [daily vol]", end="", flush=True)
+    data = _tiingo_get(url, params)
+    if not data or not isinstance(data, list) or len(data) == 0:
+        return {}
+
+    rows = []
+    for bar in data:
+        d = bar.get("date", "")[:10]
+        vol = bar.get("adjVolume", bar.get("volume", 0))
+        if vol is None:
+            vol = 0
+        rows.append({"date": date_type.fromisoformat(d), "vol": float(vol)})
+
+    ddf = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+    ddf["vol_ma"] = ddf["vol"].rolling(ma_period, min_periods=3).mean()
+
+    vol_map = {}
+    for _, row in ddf.iterrows():
+        d = row["date"]
+        vol_ma_val = float(row["vol_ma"]) if pd.notna(row["vol_ma"]) else None
+        vol_map[d] = (float(row["vol"]), vol_ma_val)
+
+    return vol_map
+
+# ====================================================================
 # SESSION BUILDER
 # ====================================================================
-def build_sessions_variant(df, asset, atr_data, close_data, variant):
+def build_sessions_variant(df, asset, atr_data, close_data, variant,
+                           daily_vol_override=None):
+    """
+    Build trading sessions from 5m bar data.
+    daily_vol_override: optional {date: (volume, vol_ma)} dict from Tiingo daily
+                        endpoint.  When provided, overrides the (broken) synthetic
+                        volume derived from IEX 5min bars.
+    """
     or_duration_bars = variant["or_duration_bars"]
     session_type     = variant["session_type"]
     force_close_hour = variant["force_close_hour"]
@@ -515,11 +605,16 @@ def build_sessions_variant(df, asset, atr_data, close_data, variant):
     df = df.copy()
     df["date"] = df["time"].dt.date
 
-    daily_vol = df.groupby("date")["v"].sum().reset_index()
-    daily_vol.columns = ["date", "day_vol"]
-    daily_vol["vol_ma"] = daily_vol["day_vol"].rolling(20, min_periods=3).mean()
-    vol_map = dict(zip(daily_vol["date"],
-                       zip(daily_vol["day_vol"], daily_vol["vol_ma"])))
+    if daily_vol_override:
+        # Use real daily volume from Tiingo daily endpoint
+        vol_map = daily_vol_override
+    else:
+        # Fallback: aggregate from 5m bars (works for crypto which has real vol)
+        daily_vol = df.groupby("date")["v"].sum().reset_index()
+        daily_vol.columns = ["date", "day_vol"]
+        daily_vol["vol_ma"] = daily_vol["day_vol"].rolling(20, min_periods=3).mean()
+        vol_map = dict(zip(daily_vol["date"],
+                           zip(daily_vol["day_vol"], daily_vol["vol_ma"])))
 
     sessions      = []
     prev_or_range = None
@@ -827,7 +922,9 @@ def simulate_session(sess, direction, balance, score, cfg, force_close_hour=21):
                     continue
 
             vol_ok = True
-            if cfg["breakout_vol_mult"] > 0 and idx >= 5:
+            # Skip volume filter if data has synthetic volume (all 1.0)
+            has_real_vol = float(np.max(vols)) > 1.5
+            if has_real_vol and cfg["breakout_vol_mult"] > 0 and idx >= 5:
                 prior_avg = float(np.mean(vols[max(0, idx-5):idx]))
                 if prior_avg > 0:
                     vol_ok = bar_vol >= cfg["breakout_vol_mult"] * prior_avg
@@ -1326,10 +1423,11 @@ def print_period_comparison(all_period_results):
 # RUN BACKTEST FOR ONE PERIOD
 # ====================================================================
 def run_period(period_name, period_days, all_data, sma_data_all, atr_data_all,
-               close_data_all, sma_counts):
+               close_data_all, sma_counts, daily_vol_all=None):
     """
     Run the full backtest for a given period.
     Slices data to the date range, builds sessions, runs all variants × param sets.
+    daily_vol_all: {label: {date: (vol, vol_ma)}} from Tiingo daily endpoint.
     Returns results dict: results[pset_name][variant_name] = {...}
     """
     today     = datetime.now(timezone.utc).date()
@@ -1376,9 +1474,15 @@ def run_period(period_name, period_days, all_data, sma_data_all, atr_data_all,
             if df is None or len(df) < 20:
                 continue
 
+            # Pass daily volume override for IEX assets (have no 5m volume)
+            dvol_override = None
+            if daily_vol_all and label in daily_vol_all:
+                dvol_override = daily_vol_all[label]
+
             sessions = build_sessions_variant(
                 df, asset, atr_data_all.get(label, {}),
-                close_data_all.get(label, {}), variant
+                close_data_all.get(label, {}), variant,
+                daily_vol_override=dvol_override
             )
             for s in sessions:
                 all_sessions_by_date[s["date"]].append(s)
@@ -1463,18 +1567,22 @@ def main():
     # Request budget estimation:
     #   IEX stocks (9 tickers): 3 chunks each for 5Y at 2yr chunks = 27 requests
     #   Crypto (1 ticker): 11 chunks for 5Y at 180d chunks            = 11 requests
-    #   Daily: computed from 5m data (0 extra requests)
-    #   Total ≈ 38 requests.  At 75s spacing ≈ 48 minutes.
+    #   Daily volume (9 IEX tickers): 1 request each                   =  9 requests
+    #   Daily SMA/ATR: computed from 5m data (0 extra requests)
+    #   Total ≈ 47 requests.  At 75s spacing ≈ 59 minutes.
     n_assets = len(ASSETS)
     iex_assets = sum(1 for a in ASSETS if a["source"] == "iex")
     crypto_assets = sum(1 for a in ASSETS if a["source"] == "crypto")
     est_iex_chunks = iex_assets * 3  # 5Y / 2yr = 3 chunks per IEX asset
     est_crypto_chunks = crypto_assets * 11  # 5Y / 180d ≈ 11 chunks
-    est_total = est_iex_chunks + est_crypto_chunks
+    est_daily_vol = iex_assets  # 1 request per IEX ticker for daily volume
+    est_total = est_iex_chunks + est_crypto_chunks + est_daily_vol
     est_min = est_total * REQUEST_GAP_SEC / 60
-    print(f"  Estimated API calls: ~{est_total} (IEX: ~{est_iex_chunks}, Crypto: ~{est_crypto_chunks})")
+    print(f"  Estimated API calls: ~{est_total} (IEX 5m: ~{est_iex_chunks}, "
+          f"Crypto 5m: ~{est_crypto_chunks}, Daily vol: ~{est_daily_vol})")
     print(f"  Estimated time: ~{est_min:.0f} min (rate limit: {REQUEST_GAP_SEC}s between requests)")
     print(f"  Daily SMA/ATR will be computed from 5m data (saves {n_assets} API calls)")
+    print(f"  Daily volume from Tiingo daily endpoint (IEX 5m has no volume)")
     print(f"  Cached assets will be loaded instantly.")
     sec()
 
@@ -1529,6 +1637,31 @@ def main():
             print(f"    {label:<6}  NO DATA")
     print()
 
+    # ── Phase 1b: Fetch daily volume for IEX assets ───────────────
+    # IEX 5min data has NO volume column — fetch real daily volume
+    # from Tiingo's daily endpoint for proper VOL scoring.
+    daily_vol_all = {}
+    iex_tickers = [(a["label"], a["tiingo_sym"]) for a in ASSETS if a["source"] == "iex"]
+    print("  Phase 1b: Fetching daily volume for IEX assets (5m has no volume)...")
+    sec()
+    for i, (label, ticker) in enumerate(iex_tickers):
+        cached_vol = load_daily_vol_cache(label)
+        if cached_vol is not None and len(cached_vol) > 50:
+            daily_vol_all[label] = cached_vol
+            print(f"    [{i+1}/{len(iex_tickers)}] {label:<6}  daily vol: "
+                  f"{len(cached_vol):>5} days [CACHED]")
+        else:
+            print(f"    [{i+1}/{len(iex_tickers)}] {label:<6}  daily vol: fetching",
+                  end="", flush=True)
+            vol_map = fetch_tiingo_daily_volume(ticker, start_5y, end_date)
+            if vol_map:
+                daily_vol_all[label] = vol_map
+                save_daily_vol_cache(label, vol_map)
+                print(f" => {len(vol_map):>5} days")
+            else:
+                print(f" => FAILED (no volume data)")
+    print()
+
     # ── Phase 2: Run backtests for each period ────────────────────
     all_period_results = {}
 
@@ -1540,7 +1673,8 @@ def main():
 
         period_results = run_period(
             period_name, period_days, all_data,
-            sma_data_all, atr_data_all, close_data_all, sma_counts
+            sma_data_all, atr_data_all, close_data_all, sma_counts,
+            daily_vol_all=daily_vol_all
         )
         all_period_results[period_name] = period_results
         print()
