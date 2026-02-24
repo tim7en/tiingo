@@ -1100,6 +1100,277 @@ def run_concentrated(all_sessions_by_date, sma_data_all, atr_data_all,
         "filter_stats":  filter_stats,
     }
 
+
+# ====================================================================
+# DCA SIMULATION — monthly contributions over multi-year period
+# ====================================================================
+def run_concentrated_dca(all_sessions_by_date, sma_data_all, atr_data_all,
+                         force_close_hour=21, cfg=None,
+                         dca_schedule=None):
+    """
+    Same as run_concentrated but with monthly DCA contributions.
+    dca_schedule: dict mapping year_number (1,2,...) to monthly_contribution ($).
+                  Example: {1: 100, 2: 200, 3: 300, 4: 400, 5: 500}
+    The year number is relative to the first trading date.
+    """
+    if cfg is None:
+        cfg = list(PARAM_SETS.values())[0]
+    if dca_schedule is None:
+        dca_schedule = {}
+
+    balance       = 0.0  # start empty — first contribution comes at month 1
+    total_contrib = 0.0
+    equity_curve  = [balance]
+    trades        = []
+    daily_log     = []
+    skipped_score = 0
+    no_setup_days = 0
+    filter_stats  = {"gap": 0, "atr": 0}
+    kelly_history = []
+    contrib_log   = []
+
+    sorted_dates = sorted(all_sessions_by_date.keys())
+    if not sorted_dates:
+        return {"trades": [], "equity_curve": [0], "daily_log": [],
+                "balance": 0, "total_contrib": 0, "contrib_log": [],
+                "skipped_score": 0, "no_setup_days": 0, "filter_stats": {}}
+
+    start_date    = sorted_dates[0]
+    last_contrib_month = None  # (year, month) of last contribution
+
+    for d in sorted_dates:
+        # ── Monthly DCA contribution ──
+        d_month = (d.year, d.month)
+        if d_month != last_contrib_month:
+            elapsed_days = (d - start_date).days
+            year_num = elapsed_days // 365 + 1  # 1-based year
+            monthly_amount = dca_schedule.get(year_num, 0)
+            if monthly_amount > 0:
+                balance_before = balance
+                balance += monthly_amount
+                total_contrib += monthly_amount
+                contrib_log.append({
+                    "date": d, "year": year_num,
+                    "amount": monthly_amount,
+                    "balance_before": balance_before,
+                    "balance_after": balance,
+                    "total_contrib": total_contrib,
+                })
+            last_contrib_month = d_month
+
+        # ── Same logic as run_concentrated ──
+        day_sessions = all_sessions_by_date[d]
+        candidates   = []
+
+        for sess in day_sessions:
+            label    = sess["label"]
+            ref_px   = sess["or_close"]
+            or_range = sess["or_range"]
+            range_pct= (or_range / ref_px * 100) if ref_px > 0 else 0
+
+            if range_pct < cfg["min_or_range_pct"] or range_pct > cfg["max_or_range_pct"]:
+                continue
+            if cfg["max_gap_pct"] > 0 and sess["gap_pct"] > cfg["max_gap_pct"]:
+                filter_stats["gap"] += 1; continue
+            atr20 = sess.get("atr20")
+            if cfg["max_or_atr_mult"] > 0 and atr20 and atr20 > 0:
+                if or_range > cfg["max_or_atr_mult"] * atr20:
+                    filter_stats["atr"] += 1; continue
+
+            sma_info = sma_data_all.get(label, {})
+            s_long,  r_long  = score_setup(sess, sma_info, "long",  cfg)
+            s_short, r_short = score_setup(sess, sma_info, "short", cfg)
+
+            if s_long >= s_short:
+                candidates.append((s_long,  "long",  sess, r_long))
+            else:
+                candidates.append((s_short, "short", sess, r_short))
+
+        if not candidates:
+            no_setup_days += 1; equity_curve.append(balance); continue
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        qualified = [(sc, dr, ss, rs) for sc, dr, ss, rs in candidates
+                     if sc >= cfg["min_score"]]
+
+        if not qualified:
+            skipped_score += 1; equity_curve.append(balance); continue
+
+        picks          = []
+        picked_assets  = set()
+        picked_classes = set()
+
+        for sc, dr, ss, rs in qualified:
+            if ss["label"] in picked_assets:
+                continue
+            asset_class = ASSET_CLASS.get(ss["label"], "unknown")
+            if len(picks) == 0:
+                picks.append((sc, dr, ss, rs))
+                picked_assets.add(ss["label"])
+                picked_classes.add(asset_class)
+            elif len(picks) == 1 and cfg["max_daily_trades"] >= 2:
+                if asset_class not in picked_classes:
+                    picks.append((sc, dr, ss, rs))
+                    picked_assets.add(ss["label"])
+                    picked_classes.add(asset_class)
+                    break
+            else:
+                break
+
+        kelly_risk     = compute_kelly(kelly_history[-cfg["kelly_lookback"]:], cfg,
+                                       fallback_pct=cfg["risk_pct"])
+
+        for sc, dr, ss, rs in picks:
+            if balance < 1.0:
+                continue
+            new_balance, trade = simulate_session(
+                ss, dr, balance, sc, cfg,
+                force_close_hour=ss.get("session_close_hour", force_close_hour)
+            )
+            if trade:
+                trades.append(trade)
+                kelly_history.append(trade)
+                daily_log.append({
+                    "date":        d,
+                    "action":      "TRADE",
+                    "asset":       trade.label,
+                    "dir":         trade.direction,
+                    "score":       sc,
+                    "entry":       trade.entry,
+                    "exit":        trade.exit_price,
+                    "exit_reason": trade.exit_reason,
+                    "pnl_usd":     new_balance - balance,
+                    "r_mult":      trade.r_mult,
+                    "balance":     new_balance,
+                })
+            balance = new_balance
+
+        equity_curve.append(max(balance, 0.01))
+
+    return {
+        "trades":        trades,
+        "equity_curve":  equity_curve,
+        "daily_log":     daily_log,
+        "balance":       balance,
+        "total_contrib": total_contrib,
+        "contrib_log":   contrib_log,
+        "skipped_score": skipped_score,
+        "no_setup_days": no_setup_days,
+        "filter_stats":  filter_stats,
+    }
+
+# ====================================================================
+# TWR / MWR HELPERS
+# ====================================================================
+def compute_twr(contrib_log, final_balance):
+    """
+    Time-Weighted Return (TWR).
+    Chains sub-period holding-period returns between each cash flow.
+    TWR = product(1 + HPR_i) - 1
+    Removes the effect of contribution timing & size.
+    """
+    if not contrib_log:
+        return 0.0
+
+    twr_product = 1.0
+
+    for i, entry in enumerate(contrib_log):
+        bal_before = entry["balance_before"]
+        if i == 0:
+            # First contribution: no prior sub-period (balance was 0)
+            pass
+        else:
+            # Sub-period return: from after previous contribution to just before this one
+            prev_balance_after = contrib_log[i - 1]["balance_after"]
+            if prev_balance_after > 0:
+                hpr = bal_before / prev_balance_after
+                twr_product *= hpr
+
+    # Final sub-period: from last contribution to final balance
+    if contrib_log:
+        last_balance_after = contrib_log[-1]["balance_after"]
+        if last_balance_after > 0:
+            hpr = final_balance / last_balance_after
+            twr_product *= hpr
+
+    return (twr_product - 1.0) * 100  # as percentage
+
+
+def compute_mwr_irr(contrib_log, final_balance, start_date):
+    """
+    Money-Weighted Return (MWR) = Internal Rate of Return (IRR).
+    Solves for discount rate r where NPV of all cash flows = 0.
+    Cash flows: negative for contributions, positive for final balance.
+    Returns annualized IRR as a percentage.
+    """
+    if not contrib_log or final_balance <= 0:
+        return 0.0
+
+    # Build cash flow series: (day_offset, amount)
+    # Contributions are negative (outflows from investor), final value is positive
+    cashflows = []
+    for entry in contrib_log:
+        t = (entry["date"] - start_date).days
+        cashflows.append((t, -entry["amount"]))
+
+    # Final value as positive inflow
+    last_date = contrib_log[-1]["date"]
+    # Assume final balance at last date + some reasonable offset
+    # Use the last contribution date's offset as a proxy
+    t_final = cashflows[-1][0]  # same end as last cashflow
+    if t_final == 0:
+        t_final = 1
+    cashflows.append((t_final, final_balance))
+
+    # Solve NPV(r) = 0 via bisection
+    def npv(r):
+        if r <= -1.0:
+            return float("inf")
+        total = 0.0
+        for t_days, cf in cashflows:
+            year_frac = t_days / 365.25
+            total += cf / ((1.0 + r) ** year_frac)
+        return total
+
+    # Bisection between -0.99 and 100 (10,000% annual)
+    lo, hi = -0.50, 50.0
+    try:
+        npv_lo, npv_hi = npv(lo), npv(hi)
+        if npv_lo * npv_hi > 0:
+            # Same sign — try wider bounds
+            lo, hi = -0.90, 200.0
+            npv_lo, npv_hi = npv(lo), npv(hi)
+            if npv_lo * npv_hi > 0:
+                return 0.0  # cannot solve
+
+        for _ in range(200):  # 200 iterations for very high precision
+            mid = (lo + hi) / 2.0
+            npv_mid = npv(mid)
+            if abs(npv_mid) < 1e-6:
+                break
+            if npv_mid * npv_lo > 0:
+                lo = mid
+                npv_lo = npv_mid
+            else:
+                hi = mid
+                npv_hi = npv_mid
+
+        irr = (lo + hi) / 2.0
+        return irr * 100  # as percentage
+    except (OverflowError, ZeroDivisionError, ValueError):
+        return 0.0
+
+
+def annualize_return(total_return_pct, years):
+    """Convert total return % to annualized (CAGR) %."""
+    if years <= 0:
+        return 0.0
+    r = total_return_pct / 100.0
+    if r <= -1.0:
+        return -100.0
+    return ((1.0 + r) ** (1.0 / years) - 1.0) * 100
+
+
 # ====================================================================
 # PER-ASSET INDEPENDENT
 # ====================================================================
@@ -1303,6 +1574,13 @@ def compute_stats(trades, equity_curve, start_bal):
     daily_r = np.diff(np.log(np.maximum(eq, 1e-9)))
     sharpe  = float(daily_r.mean() / daily_r.std() * np.sqrt(252)) \
               if len(daily_r) > 1 and daily_r.std() > 0 else 0.0
+
+    # Sortino ratio (downside deviation only)
+    neg_r   = daily_r[daily_r < 0]
+    down_std= float(np.std(neg_r)) if len(neg_r) > 1 else 0.0
+    sortino = float(daily_r.mean() / down_std * np.sqrt(252)) \
+              if down_std > 0 else 0.0
+
     by_reason = {}
     for t in trades:
         by_reason[t.exit_reason] = by_reason.get(t.exit_reason, 0) + 1
@@ -1314,24 +1592,85 @@ def compute_stats(trades, equity_curve, start_bal):
     years  = max(n_days / 252, 0.01)
     cagr   = ((eq[-1] / eq[0]) ** (1.0 / years) - 1) * 100 if eq[0] > 0 else 0.0
 
+    # Calmar ratio = CAGR / |MaxDD|
+    calmar = abs(cagr / maxdd) if maxdd != 0 else 0.0
+
+    # Average trade PnL ($)
+    avg_pnl = float(np.mean([t.pnl for t in trades]))
+
+    # Expectancy (avg R-multiple)
+    expectancy_r = float(np.mean([t.r_mult for t in trades]))
+
+    # Win/Loss ratio (avg win $ / avg loss $)
+    avg_win_pnl = float(np.mean([t.pnl for t in wins]))  if wins else 0.0
+    avg_los_pnl = float(np.mean([abs(t.pnl) for t in loss])) if loss else 0.0
+    wl_ratio = avg_win_pnl / avg_los_pnl if avg_los_pnl > 0 else float("inf")
+
+    # Max consecutive wins / losses
+    max_consec_w, max_consec_l = 0, 0
+    cw, cl = 0, 0
+    for t in trades:
+        if t.pnl > 0:
+            cw += 1; cl = 0
+            max_consec_w = max(max_consec_w, cw)
+        else:
+            cl += 1; cw = 0
+            max_consec_l = max(max_consec_l, cl)
+
+    # Recovery factor = total profit / |MaxDD $ |
+    total_profit = float(eq[-1] - eq[0])
+    max_dd_abs   = float(np.min(eq - peak))  # negative number
+    recovery     = total_profit / abs(max_dd_abs) if max_dd_abs != 0 else 0.0
+
+    # Leverage: all qualifying trades use same formula
+    levs = [min(10, 5 + t.score) for t in trades]
+    avg_lev = float(np.mean(levs)) if levs else 0.0
+    max_lev = max(levs) if levs else 0
+
+    # Longest drawdown duration (trading days)
+    in_dd = (eq < peak)
+    max_dd_dur = 0
+    cur_dd_dur = 0
+    for x in in_dd:
+        if x:
+            cur_dd_dur += 1
+            max_dd_dur = max(max_dd_dur, cur_dd_dur)
+        else:
+            cur_dd_dur = 0
+
     return {
-        "trades":       len(trades),
-        "wins":         len(wins),
-        "losses":       len(loss),
-        "win_rate":     wr,
-        "avg_win_r":    avg_win_r,
-        "avg_loss_r":   avg_los_r,
-        "profit_factor":pf,
-        "tp1_hit_rate": sum(1 for t in trades if t.tp1_hit) / len(trades) * 100,
-        "total_return": ret,
-        "max_drawdown": maxdd,
-        "sharpe":       sharpe,
-        "cagr":         cagr,
-        "final_balance":float(eq[-1]),
-        "by_reason":    by_reason,
-        "by_asset":     {k: len(v) for k, v in by_asset.items()},
-        "avg_score":    float(np.mean([t.score for t in trades])),
-        "trading_days": n_days,
+        "trades":          len(trades),
+        "wins":            len(wins),
+        "losses":          len(loss),
+        "win_rate":        wr,
+        "avg_win_r":       avg_win_r,
+        "avg_loss_r":      avg_los_r,
+        "profit_factor":   pf,
+        "tp1_hit_rate":    sum(1 for t in trades if t.tp1_hit) / len(trades) * 100,
+        "total_return":    ret,
+        "max_drawdown":    maxdd,
+        "sharpe":          sharpe,
+        "sortino":         sortino,
+        "calmar":          calmar,
+        "cagr":            cagr,
+        "final_balance":   float(eq[-1]),
+        "by_reason":       by_reason,
+        "by_asset":        {k: len(v) for k, v in by_asset.items()},
+        "avg_score":       float(np.mean([t.score for t in trades])),
+        "trading_days":    n_days,
+        "avg_pnl":         avg_pnl,
+        "expectancy_r":    expectancy_r,
+        "wl_ratio":        wl_ratio,
+        "max_consec_wins": max_consec_w,
+        "max_consec_loss": max_consec_l,
+        "recovery_factor": recovery,
+        "avg_leverage":    avg_lev,
+        "max_leverage":    max_lev,
+        "max_dd_duration": max_dd_dur,
+        "avg_win_pnl":     avg_win_pnl,
+        "avg_los_pnl":     avg_los_pnl,
+        "total_profit":    total_profit,
+        "years":           years,
     }
 
 # ====================================================================
@@ -1533,12 +1872,7 @@ def run_period(period_name, period_days, all_data, sma_data_all, atr_data_all,
             "per_asset": {},
         }
 
-    return all_results
-
-
-# ====================================================================
-# MAIN
-# ====================================================================
+    return all_results, _us5_by_date, _us15_by_date
 def main():
     bar()
     print("  ORB BACKTEST — Tiingo API — Intraday 5min + 15min")
@@ -1664,6 +1998,7 @@ def main():
 
     # ── Phase 2: Run backtests for each period ────────────────────
     all_period_results = {}
+    all_period_sessions = {}  # store sessions for DCA phase
 
     for period_name, period_days in PERIODS.items():
         bar()
@@ -1671,12 +2006,13 @@ def main():
         bar()
         print()
 
-        period_results = run_period(
+        period_results, us5_sess, us15_sess = run_period(
             period_name, period_days, all_data,
             sma_data_all, atr_data_all, close_data_all, sma_counts,
             daily_vol_all=daily_vol_all
         )
         all_period_results[period_name] = period_results
+        all_period_sessions[period_name] = (us5_sess, us15_sess)
         print()
 
         # Print detailed results for this period
@@ -1734,15 +2070,18 @@ def main():
                       f"pnl={e['pnl_usd']:+.2f}")
             print()
 
-    # ── Final summary ─────────────────────────────────────────────
+    # ── GRAND SUMMARY — comprehensive comparison ─────────────────
     bar()
-    print("  KEY FINDINGS — PERIOD COMPARISON SUMMARY")
-    sec()
+    print("  GRAND SUMMARY — ALL PERIODS × PARAM SETS × VARIANTS")
+    bar()
+    print()
+
+    # Collect all combos
+    summary_rows = []
     for period_name in ["1Y", "3Y", "5Y"]:
         if period_name not in all_period_results:
             continue
         pdata = all_period_results[period_name]
-        print(f"  --- {period_name} ---")
         for pname in PARAM_SETS:
             if pname not in pdata:
                 continue
@@ -1750,18 +2089,288 @@ def main():
                 if vname not in pdata[pname]:
                     continue
                 stats = pdata[pname][vname]["stats"]
-                tag   = f"{pname}/{vname}"
                 if stats:
-                    pf_s = (f"{stats['profit_factor']:.2f}"
-                            if stats['profit_factor'] < 1e6 else "INF")
-                    mark = "  ** COMBINED" if "Combined" in vname else ""
-                    print(f"    {tag:<26}: {stats['trades']}T  "
-                          f"WR {stats['win_rate']:.1f}%  PF {pf_s}  "
-                          f"CAGR {stats['cagr']:.1f}%  "
-                          f"MaxDD {stats['max_drawdown']:.1f}%  "
-                          f"Ret {stats['total_return']:+.1f}%{mark}")
-                else:
-                    print(f"    {tag:<26}: NO TRADES")
+                    summary_rows.append({
+                        "period": period_name, "pset": pname,
+                        "variant": vname, "stats": stats,
+                    })
+
+    if summary_rows:
+        # ── Table 1: Core Performance ──
+        bar()
+        print("  TABLE 1: CORE PERFORMANCE")
+        sec()
+        hdr = (f"  {'Period':<6} {'PSet':<5} {'Variant':<20} {'T':>4} "
+               f"{'W':>3} {'L':>3} {'WR%':>6} {'PF':>6} {'W/L':>5} "
+               f"{'TP1%':>5} {'AvgR':>6} {'E[R]':>6}")
+        print(hdr)
+        sec()
+        for r in summary_rows:
+            s = r["stats"]
+            pf_s = f"{s['profit_factor']:.2f}" if s['profit_factor'] < 1e6 else "INF"
+            wl_s = f"{s['wl_ratio']:.2f}" if s['wl_ratio'] < 1e6 else "INF"
+            print(f"  {r['period']:<6} {r['pset']:<5} {r['variant']:<20} "
+                  f"{s['trades']:>4} {s['wins']:>3} {s['losses']:>3} "
+                  f"{s['win_rate']:>5.1f}% {pf_s:>6} {wl_s:>5} "
+                  f"{s['tp1_hit_rate']:>4.0f}% "
+                  f"{s['avg_win_r']:>+5.2f} {s['expectancy_r']:>+5.2f}")
+        print()
+
+        # ── Table 2: Risk-Adjusted Returns ──
+        bar()
+        print("  TABLE 2: RISK-ADJUSTED RETURNS")
+        sec()
+        hdr2 = (f"  {'Period':<6} {'PSet':<5} {'Variant':<20} "
+                f"{'CAGR%':>7} {'TotRet%':>8} {'MaxDD%':>7} "
+                f"{'Sharpe':>7} {'Sortino':>8} {'Calmar':>7} "
+                f"{'RecFac':>7} {'$Final':>8}")
+        print(hdr2)
+        sec()
+        for r in summary_rows:
+            s = r["stats"]
+            print(f"  {r['period']:<6} {r['pset']:<5} {r['variant']:<20} "
+                  f"{s['cagr']:>6.1f}% {s['total_return']:>+7.1f}% "
+                  f"{s['max_drawdown']:>+6.1f}% "
+                  f"{s['sharpe']:>7.2f} {s['sortino']:>8.2f} {s['calmar']:>7.2f} "
+                  f"{s['recovery_factor']:>7.2f} ${s['final_balance']:>7.2f}")
+        print()
+
+        # ── Table 3: Trade Details & Leverage ──
+        bar()
+        print("  TABLE 3: TRADE DETAILS & LEVERAGE")
+        sec()
+        hdr3 = (f"  {'Period':<6} {'PSet':<5} {'Variant':<20} "
+                f"{'AvgPnL$':>8} {'AvgWin$':>8} {'AvgLos$':>8} "
+                f"{'CW':>3} {'CL':>3} {'AvgLev':>7} {'MaxLev':>7} "
+                f"{'DDdur':>5} {'Days':>5} {'Yrs':>5}")
+        print(hdr3)
+        sec()
+        for r in summary_rows:
+            s = r["stats"]
+            print(f"  {r['period']:<6} {r['pset']:<5} {r['variant']:<20} "
+                  f"{s['avg_pnl']:>+7.2f} {s['avg_win_pnl']:>+7.2f} "
+                  f"{s['avg_los_pnl']:>7.2f} "
+                  f"{s['max_consec_wins']:>3} {s['max_consec_loss']:>3} "
+                  f"{s['avg_leverage']:>6.1f}x {s['max_leverage']:>6}x "
+                  f"{s['max_dd_duration']:>5} {s['trading_days']:>5} "
+                  f"{s['years']:>4.1f}")
+        print()
+
+        # ── Table 4: Asset Distribution (per-period best combo) ──
+        bar()
+        print("  TABLE 4: ASSET DISTRIBUTION (by period, Combined wallet)")
+        sec()
+        for period_name in ["1Y", "3Y", "5Y"]:
+            if period_name not in all_period_results:
+                continue
+            pdata = all_period_results[period_name]
+            for pname in PARAM_SETS:
+                if pname not in pdata or "CombinedUS_5and15" not in pdata[pname]:
+                    continue
+                s = pdata[pname]["CombinedUS_5and15"]["stats"]
+                if not s:
+                    continue
+                ba = s["by_asset"]
+                br = s["by_reason"]
+                assets_str = "  ".join(f"{k}:{v}" for k, v in
+                                       sorted(ba.items(), key=lambda x: -x[1]))
+                exits_str  = "  ".join(f"{k}:{v}" for k, v in
+                                       sorted(br.items(), key=lambda x: -x[1]))
+                print(f"  {period_name}/{pname:<5} Assets: {assets_str}")
+                print(f"  {'':>9} Exits:  {exits_str}")
+        print()
+
+        # ── Highlight: Best combos by metric ──
+        bar()
+        print("  BEST COMBINATIONS BY METRIC")
+        sec()
+        metrics_to_rank = [
+            ("Highest Sharpe",       "sharpe",          True,  ".2f",  ""),
+            ("Highest Sortino",      "sortino",         True,  ".2f",  ""),
+            ("Highest Calmar",       "calmar",          True,  ".2f",  ""),
+            ("Highest CAGR",         "cagr",            True,  ".1f",  "%"),
+            ("Highest Total Return", "total_return",    True,  "+.1f", "%"),
+            ("Highest Win Rate",     "win_rate",        True,  ".1f",  "%"),
+            ("Highest Profit Factor","profit_factor",   True,  ".2f",  ""),
+            ("Best Expectancy (R)",  "expectancy_r",    True,  "+.3f", ""),
+            ("Shallowest MaxDD",     "max_drawdown",    False, "+.1f", "%"),
+            ("Highest Recovery",     "recovery_factor", True,  ".2f",  ""),
+        ]
+        for label, key, higher_better, fmt, suffix in metrics_to_rank:
+            best = None
+            for r in summary_rows:
+                val = r["stats"][key]
+                if best is None:
+                    best = r
+                elif higher_better and val > best["stats"][key]:
+                    best = r
+                elif not higher_better and val > best["stats"][key]:
+                    best = r
+            if best:
+                val = best["stats"][key]
+                val_s = f"{val:{fmt}}{suffix}" if fmt else f"{val}"
+                tag = f"{best['period']}/{best['pset']}/{best['variant']}"
+                print(f"    {label:<24}  {val_s:>10}  <- {tag}")
+        print()
+
+    # ── Leverage summary ──
+    bar()
+    print("  LEVERAGE DETAILS")
+    sec()
+    print(f"    Formula:  leverage = min(max_leverage, 5 + score)")
+    print(f"    max_leverage config = {BASE_CFG['max_leverage']}")
+    print(f"    Qualifying scores:  min_score = 7 (S10) or 8 (S9, S12)")
+    print(f"    Score 7 -> min(10, 12) = 10x    Score 8 -> min(10, 13) = 10x")
+    print(f"    => All qualifying trades use 10x leverage")
+    print()
+
+    # ── Phase 4: DCA Simulation ───────────────────────────────────
+    # $100/mo Y1, $200/mo Y2, $300/mo Y3, $400/mo Y4, $500/mo Y5
+    DCA_SCHEDULE = {1: 100, 2: 200, 3: 300, 4: 400, 5: 500}
+    dca_total_per_year = {y: m * 12 for y, m in DCA_SCHEDULE.items()}
+    grand_total_contrib = sum(dca_total_per_year.values())
+    # Y1=$1200, Y2=$2400, Y3=$3600, Y4=$4800, Y5=$6000 => Total=$18,000
+
+    bar()
+    print("  DCA SIMULATION — Monthly Contributions")
+    bar()
+    print(f"  Schedule:  Y1=$100/mo  Y2=$200/mo  Y3=$300/mo  Y4=$400/mo  Y5=$500/mo")
+    print(f"  Annual:    Y1=$1,200   Y2=$2,400   Y3=$3,600   Y4=$4,800   Y5=$6,000")
+    print(f"  Grand total contributed over 5 years: ${grand_total_contrib:,.0f}")
+    sec()
+    print()
+
+    dca_results = {}
+
+    for period_name in ["1Y", "3Y", "5Y"]:
+        if period_name not in all_period_sessions:
+            continue
+        us5_sess, us15_sess = all_period_sessions[period_name]
+
+        # For DCA, run combined sessions (5min + 15min merged)
+        combined_by_date = defaultdict(list)
+        all_dates = set(us5_sess.keys()) | set(us15_sess.keys())
+        for d in all_dates:
+            seen_labels = set()
+            for s in us5_sess.get(d, []):
+                combined_by_date[d].append(s)
+                seen_labels.add(s["label"])
+            for s in us15_sess.get(d, []):
+                if s["label"] not in seen_labels:
+                    combined_by_date[d].append(s)
+                    seen_labels.add(s["label"])
+
+        # Determine per-period DCA schedule slice
+        if period_name == "1Y":
+            dca_sched = {1: 100}
+        elif period_name == "3Y":
+            dca_sched = {1: 100, 2: 200, 3: 300}
+        else:
+            dca_sched = DCA_SCHEDULE
+
+        cumulative = sum(v * 12 for v in dca_sched.values())
+
+        print(f"  --- DCA {period_name} ---")
+        print(f"  Total contributed: ${cumulative:,.0f}")
+        sec(72)
+
+        for pname, cfg in PARAM_SETS.items():
+            dca_result = run_concentrated_dca(
+                combined_by_date, sma_data_all, atr_data_all,
+                force_close_hour=21, cfg=cfg,
+                dca_schedule=dca_sched,
+            )
+            total_c  = dca_result["total_contrib"]
+            final_b  = dca_result["balance"]
+            trades_n = len(dca_result["trades"])
+            gain     = final_b - total_c
+            roi      = (gain / total_c * 100) if total_c > 0 else 0
+            c_log    = dca_result["contrib_log"]
+
+            # ── TWR & MWR ──
+            twr_pct  = compute_twr(c_log, final_b)
+            s_date   = sorted(combined_by_date.keys())[0] if combined_by_date else c_log[0]["date"]
+            mwr_pct  = compute_mwr_irr(c_log, final_b, s_date)
+
+            # Annualize
+            if c_log:
+                span_days = (c_log[-1]["date"] - c_log[0]["date"]).days
+            else:
+                span_days = 0
+            span_years = max(span_days / 365.25, 0.01)
+            twr_ann = annualize_return(twr_pct, span_years)
+
+            dca_results[f"{period_name}/{pname}"] = {
+                "total_contrib": total_c,
+                "final_balance": final_b,
+                "trades":        trades_n,
+                "gain":          gain,
+                "roi":           roi,
+                "twr":           twr_pct,
+                "twr_ann":       twr_ann,
+                "mwr":           mwr_pct,
+                "span_years":    span_years,
+                "contrib_log":   c_log,
+            }
+
+            print(f"    {pname:<5}  Trades: {trades_n:>3}  "
+                  f"Contributed: ${total_c:>9,.2f}  "
+                  f"Final: ${final_b:>10,.2f}  "
+                  f"Gain: ${gain:>+10,.2f}  "
+                  f"ROI: {roi:>+.1f}%")
+            print(f"           TWR: {twr_pct:>+.1f}% (ann: {twr_ann:>+.1f}%)  "
+                  f"MWR/IRR: {mwr_pct:>+.1f}% p.a.")
+
+        print()
+
+    # DCA summary table
+    if dca_results:
+        bar()
+        print("  DCA SUMMARY TABLE")
+        sec()
+        print(f"  {'Period/PSet':<16} {'Contrib':>10} {'Final$':>10} "
+              f"{'Gain':>10} {'ROI':>7} {'TWR':>8} {'TWR/yr':>8} "
+              f"{'MWR/yr':>8} {'Trades':>6}")
+        sec()
+        for key, dr in dca_results.items():
+            print(f"  {key:<16} ${dr['total_contrib']:>8,.0f} "
+                  f"${dr['final_balance']:>8,.0f} "
+                  f"${dr['gain']:>+8,.0f} {dr['roi']:>+6.1f}% "
+                  f"{dr['twr']:>+7.1f}% {dr['twr_ann']:>+7.1f}% "
+                  f"{dr['mwr']:>+7.1f}% "
+                  f"{dr['trades']:>5}")
+        sec()
+        # Find best DCA by each metric
+        best_roi = max(dca_results, key=lambda k: dca_results[k]["roi"])
+        best_twr = max(dca_results, key=lambda k: dca_results[k]["twr"])
+        best_mwr = max(dca_results, key=lambda k: dca_results[k]["mwr"])
+        br = dca_results[best_roi]
+        bt = dca_results[best_twr]
+        bm = dca_results[best_mwr]
+        print(f"  Best ROI:     {best_roi:<16}  "
+              f"(${br['total_contrib']:,.0f} -> ${br['final_balance']:,.0f} = {br['roi']:+.1f}%)")
+        print(f"  Best TWR:     {best_twr:<16}  "
+              f"(total {bt['twr']:+.1f}%, annualized {bt['twr_ann']:+.1f}%)")
+        print(f"  Best MWR/IRR: {best_mwr:<16}  "
+              f"({bm['mwr']:+.1f}% annualized)")
+        print()
+
+        # Explanation box
+        bar()
+        print("  TWR vs MWR EXPLAINED")
+        sec()
+        print("  TWR (Time-Weighted Return):")
+        print("    Measures pure strategy performance, independent of cash flow timing.")
+        print("    Chains sub-period returns between each contribution.")
+        print("    Use to compare STRATEGY quality across configs.")
+        print()
+        print("  MWR (Money-Weighted Return / IRR):")
+        print("    Measures the actual investor's annualized return on capital deployed.")
+        print("    Accounts for contribution timing and size (DCA schedule).")
+        print("    Use to evaluate YOUR personal investment outcome.")
+        print()
+        print("  If MWR > TWR/yr:  Your DCA timing added value (more $ before good periods).")
+        print("  If MWR < TWR/yr:  Your DCA timing lost value (more $ before bad periods).")
         print()
 
     bar()
