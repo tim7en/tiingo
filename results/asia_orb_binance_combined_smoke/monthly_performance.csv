@@ -1,0 +1,16 @@
+month,trades,total_pnl_usd,win_rate_pct,scope,asset,strategy_mode,buffer_pct,sizing_mode,pboc_filter,volume_filter,atr_filter,config_id,volume_threshold
+2025-12,213,-4125.972021901867,46.948356807511736,portfolio,ALL,asia_combined_5m_15m,0,risk_1pct,False,False,False,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-0,0.4
+2026-01,213,18265.143911228446,51.173708920187785,portfolio,ALL,asia_combined_5m_15m,0,risk_1pct,False,False,False,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-0,0.4
+2025-12,54,3332.8369685535963,50.0,asset,BTC,asia_combined_5m_15m,0,risk_1pct,False,False,False,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-0,0.4
+2026-01,54,13928.542384035898,55.55555555555556,asset,BTC,asia_combined_5m_15m,0,risk_1pct,False,False,False,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-0,0.4
+2025-12,53,6157.21157414618,49.056603773584904,asset,ETH,asia_combined_5m_15m,0,risk_1pct,False,False,False,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-0,0.4
+2026-01,54,3381.250029050584,46.2962962962963,asset,ETH,asia_combined_5m_15m,0,risk_1pct,False,False,False,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-0,0.4
+2025-12,54,-5742.14303670047,44.44444444444444,asset,SOL,asia_combined_5m_15m,0,risk_1pct,False,False,False,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-0,0.4
+2026-01,53,1072.1986541821866,49.056603773584904,asset,SOL,asia_combined_5m_15m,0,risk_1pct,False,False,False,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-0,0.4
+2025-12,52,-5200.691404035414,44.230769230769226,asset,XAU,asia_combined_5m_15m,0,risk_1pct,False,False,False,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-0,0.4
+2026-01,52,2176.359481910515,53.84615384615385,asset,XAU,asia_combined_5m_15m,0,risk_1pct,False,False,False,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-0,0.4
+2026-01,111,15843.144191686228,56.75675675675676,portfolio,ALL,asia_combined_5m_15m,0,risk_1pct,False,False,True,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-1,0.4
+2026-01,12,2938.902690730265,58.333333333333336,asset,BTC,asia_combined_5m_15m,0,risk_1pct,False,False,True,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-1,0.4
+2026-01,30,2466.6762615422613,50.0,asset,ETH,asia_combined_5m_15m,0,risk_1pct,False,False,True,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-1,0.4
+2026-01,33,5519.670418952833,57.57575757575758,asset,SOL,asia_combined_5m_15m,0,risk_1pct,False,False,True,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-1,0.4
+2026-01,36,4962.847303774359,61.111111111111114,asset,XAU,asia_combined_5m_15m,0,risk_1pct,False,False,True,mode-asia_combined_5m_15m_buf0_size-risk_1pct_pboc-0_vol-0_atr-1,0.4

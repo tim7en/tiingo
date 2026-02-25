@@ -419,3 +419,116 @@ d:\tiingo\
     ├── *_daily.json
     └── *_daily_vol.json
 ```
+
+---
+
+## 13. Asia Session ORB (Binance) Update — 2026-02-25
+
+### Scope Clarification
+
+- Script: `backtest_asia_orb_binance.py`
+- Data: Binance Spot 5-minute candles
+- Session: Asia ORB (`01:00-01:30 UTC`), entries after `01:30 UTC`, hard exit `04:00 UTC`
+- Direction: **Both long and short are active**
+- Important: This script is **not** a 5m + 15m combined-wallet strategy. It is a 5m-candle Asia ORB only.
+
+### Asset Resolution in Binance Run
+
+| Requested | Resolved | Status |
+|----------|----------|--------|
+| BTC/USDT | BTCUSDT | Available |
+| ETH/USDT | ETHUSDT | Available |
+| SOL/USDT | SOLUSDT | Available |
+| XAU/USDT | PAXGUSDT | Proxy used (XAUUSDT not listed on spot) |
+| XAG/USDT | N/A | Unavailable on Binance spot |
+
+### Full Run 1 (Volume Threshold = 0.40x)
+
+Period: `2022-01-01` to `2026-02-25`  
+Configs: 64  
+Best config: `buf20_size-risk_1pct_pboc-1_vol-1_atr-0`
+
+| Metric | Value |
+|-------|-------|
+| Trades | 3,954 |
+| Win Rate | 49.14% |
+| Profit Factor | 1.018 |
+| Sharpe | 0.371 |
+| Max Drawdown | -38.01% |
+| Total Return | +26.32% |
+| Ending Equity (start $100,000) | $126,317 |
+
+### Full Run 2 (Volume Threshold = 1.30x)
+
+Period: `2022-01-01` to `2026-02-25`  
+Configs: 64  
+Best config: `buf0_size-risk_1pct_pboc-0_vol-1_atr-0`
+
+| Metric | Value |
+|-------|-------|
+| Trades | 1,407 |
+| Win Rate | 54.16% |
+| Profit Factor | 1.470 |
+| Sharpe | 2.907 |
+| Max Drawdown | -14.42% |
+| Total Return | +620.11% |
+| Ending Equity (start $100,000) | $720,107 |
+
+### Why Vol=1.3x Improved Results
+
+The main effect is trade-quality gating:
+
+- Fewer trades passed the session-volume condition.
+- Win rate, PF, Sharpe, and drawdown profile all improved materially.
+- This indicates low-volume Asia breakouts were a major source of noise in the loose filter setup.
+
+### Direction Split (Best Vol=1.3 Config)
+
+| Direction | Trades | Win Rate | Profit Factor | Total PnL |
+|----------|--------|----------|---------------|-----------|
+| Long | 707 | 52.76% | 1.423 | $285,823 |
+| Short | 700 | 55.57% | 1.520 | $334,284 |
+
+Both sides contributed; short side had slightly stronger efficiency in this sample.
+
+### Output Paths
+
+- `results/asia_orb_binance/` (0.40x run)
+- `results/asia_orb_binance_vol13/` (1.30x run)
+- `results/asia_orb_comparison_table.csv` (cross-run metrics comparison)
+
+---
+
+## 14. Asia ORB Execution/Mode Update — 2026-02-25 (Later)
+
+### Entry Execution Fix
+
+- Updated `backtest_asia_orb_binance.py` execution logic:
+  - Breakout is still confirmed by candle close.
+  - Fill now occurs at the **next candle open** (not on confirmation close).
+- Trade log now includes `confirmation_time` for auditability.
+
+### Combined 5m + 15m Mode Added
+
+- Added strategy modes:
+  - `asia_5m`  (OR = first 5m bar)
+  - `asia_15m` (OR = first 15m / 3 bars)
+  - `asia_30m` (OR = first 30m / 6 bars)
+  - `asia_combined_5m_15m` (union of 5m + 15m signals, shared portfolio sizing)
+- Default run mode switched to `asia_combined_5m_15m`.
+- Mode is now encoded in `config_id`.
+
+### CLI Additions
+
+- `--strategy-mode` to select OR mode.
+- `--volume-threshold` retained (e.g., `0.40`, `1.30`).
+
+### Validation Snapshot (Smoke)
+
+Run:
+`python backtest_asia_orb_binance.py --start-date 2025-12-01 --end-date 2026-01-31 --max-configs 2 --no-plots --output-dir results/asia_orb_binance_combined_smoke`
+
+Result:
+- Mode: `asia_combined_5m_15m`
+- Completed with portfolio/asset/trade outputs.
+- Trade logs show `confirmation_time` followed by `entry_time` at the next bar open.
