@@ -1,0 +1,22 @@
+{
+  "label": "VIX",
+  "proxy_symbol": "vixy",
+  "proxy_name": "ProShares VIX Short-Term Futures ETF",
+  "requested_start_date": "2021-02-24",
+  "requested_end_date": "2026-02-23",
+  "fetch_method_5m": "download_5m_data.fetch_iex_5m",
+  "fetch_method_daily": "backtest_orb_tiingo.fetch_tiingo_daily",
+  "fetch_method_daily_vol": "backtest_orb_tiingo.fetch_tiingo_daily_volume",
+  "aligned_to_5m_cache": "TSLA_5m.parquet",
+  "aligned_to_daily_cache": "TSLA_daily.json",
+  "outputs": {
+    "5m": "D:\\tiingo\\cache\\VIX_5m.parquet",
+    "daily": "D:\\tiingo\\cache\\VIX_daily.json",
+    "daily_vol": "D:\\tiingo\\cache\\VIX_daily_vol.json"
+  },
+  "request_counts": {
+    "5m_small_chunk_estimate": 16,
+    "daily_and_daily_vol": 2,
+    "approx_total": 18
+  }
+}
