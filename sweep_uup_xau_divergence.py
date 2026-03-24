@@ -128,7 +128,15 @@ def main():
             if overall:
                 overall_rows.append({**common, **overall})
 
-            for segment_type in ["direction", "move_context", "weekday", "session_et", "hour_et"]:
+            for segment_type in [
+                "direction",
+                "move_context",
+                "weekday",
+                "session_et",
+                "us_window",
+                "global_window",
+                "hour_et",
+            ]:
                 for segment_value, group in events.groupby(segment_type):
                     metrics = evaluate_subset(group, min_entries=args.min_segment_entries)
                     if not metrics:
