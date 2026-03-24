@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Download 5 years of 5-minute kline data for SPY, QQQ, and copper (CPER) from Tiingo IEX."""
+"""Download long-range 5-minute kline data from Tiingo IEX into the local cache."""
 
+import argparse
 import requests
 import pandas as pd
 from datetime import datetime, timedelta, date as date_type
 import time
 import os
+from typing import Dict, List
 
 TIINGO_API_KEY = "34d03d1d1382e36010bdb817d2512a4bfa5585f3"
 TIINGO_HEADERS = {
@@ -14,14 +16,39 @@ TIINGO_HEADERS = {
 }
 TIINGO_BASE = "https://api.tiingo.com"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+ROW_CAP = 10000
+REQUEST_GAP_SEC = 75
+_last_request_ts = 0.0
 
 
-def _tiingo_get(url, params, max_retries=3):
+def _pace():
+    global _last_request_ts
+    now = time.time()
+    elapsed = now - _last_request_ts
+    if _last_request_ts > 0 and elapsed < REQUEST_GAP_SEC:
+        wait = REQUEST_GAP_SEC - elapsed
+        mins, secs = divmod(int(wait), 60)
+        print(f"\n  Pacing requests for {mins}m{secs:02d}s...", flush=True)
+        time.sleep(wait)
+    _last_request_ts = time.time()
+
+ASSET_CONFIG: Dict[str, Dict[str, str]] = {
+    "SPY": {"ticker": "spy", "start": "2021-03-12"},
+    "QQQ": {"ticker": "qqq", "start": "2021-03-12"},
+    "COPPER": {"ticker": "cper", "start": "2021-03-12"},
+    # Tiingo IEX intraday history for these proxies starts in early 2017.
+    "UUP": {"ticker": "uup", "start": "2017-01-03"},
+    "XAU": {"ticker": "gld", "start": "2017-01-03"},
+}
+
+
+def _tiingo_get(url, params, max_retries=6):
     for attempt in range(max_retries):
         try:
+            _pace()
             resp = requests.get(url, headers=TIINGO_HEADERS, params=params, timeout=90)
             if resp.status_code == 429:
-                wait = 30 * (attempt + 1)
+                wait = min(60 * (attempt + 1), 600)
                 print(f"\n  Rate limited, waiting {wait}s...", flush=True)
                 time.sleep(wait)
                 continue
@@ -37,33 +64,60 @@ def _tiingo_get(url, params, max_retries=3):
     return None
 
 
+def _fetch_iex_chunk(ticker: str, start_date: date_type, end_date: date_type, depth: int = 0):
+    url = f"{TIINGO_BASE}/iex/{ticker}/prices"
+    params = {
+        "startDate": start_date.isoformat(),
+        "endDate": end_date.isoformat(),
+        "resampleFreq": "5min",
+        "columns": "open,high,low,close,volume",
+    }
+    data = _tiingo_get(url, params)
+    if data is None:
+        raise RuntimeError(f"Request failed for {ticker} {start_date} -> {end_date}")
+    if not isinstance(data, list) or len(data) == 0:
+        return []
+    if len(data) < ROW_CAP or start_date >= end_date:
+        return data
+
+    span_days = (end_date - start_date).days
+    if span_days <= 1:
+        raise RuntimeError(
+            f"Hit Tiingo row cap on a {span_days + 1}-day request for {ticker} "
+            f"{start_date} -> {end_date}"
+        )
+
+    mid_date = start_date + timedelta(days=span_days // 2)
+    print(
+        f"\n    chunk capped at {len(data)} rows, splitting "
+        f"{start_date} -> {end_date}",
+        flush=True,
+    )
+    left = _fetch_iex_chunk(ticker, start_date, mid_date, depth + 1)
+    right = _fetch_iex_chunk(ticker, mid_date + timedelta(days=1), end_date, depth + 1)
+    return left + right
+
+
 def fetch_iex_5m(ticker: str, start_date: date_type, end_date: date_type):
-    """Fetch 5-minute bars from Tiingo IEX in 2-year chunks."""
+    """Fetch 5-minute bars from Tiingo IEX while automatically splitting capped ranges."""
     all_rows = []
     chunk_start = start_date
-    chunk_size = timedelta(days=120)  # Smaller chunks to avoid 10k row cap
+    chunk_size = timedelta(days=150)
     total_chunks = ((end_date - start_date).days // chunk_size.days) + 1
     n = 0
 
     while chunk_start <= end_date:
         chunk_end = min(chunk_start + chunk_size, end_date)
-        url = f"{TIINGO_BASE}/iex/{ticker}/prices"
-        params = {
-            "startDate": chunk_start.isoformat(),
-            "endDate": chunk_end.isoformat(),
-            "resampleFreq": "5min",
-            "columns": "open,high,low,close,volume",
-        }
         n += 1
         print(f"  [{n}/{total_chunks}]", end="", flush=True)
-        data = _tiingo_get(url, params)
-        if data and isinstance(data, list) and len(data) > 0:
+        data = _fetch_iex_chunk(ticker, chunk_start, chunk_end)
+        if data:
             all_rows.extend(data)
             print(f" +{len(data)} rows", end="", flush=True)
         else:
             print(" +0", end="", flush=True)
         chunk_start = chunk_end + timedelta(days=1)
-        time.sleep(1)  # Be nice to API
+        time.sleep(1)
 
     if not all_rows:
         return None
@@ -89,19 +143,54 @@ def fetch_iex_5m(ticker: str, start_date: date_type, end_date: date_type):
     return df
 
 
-def main():
-    end = datetime.now().date()
-    start = end - timedelta(days=5 * 365)
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "labels",
+        nargs="*",
+        help=f"Asset labels to download. Available: {', '.join(sorted(ASSET_CONFIG))}",
+    )
+    parser.add_argument(
+        "--end-date",
+        default=datetime.now().date().isoformat(),
+        help="End date in YYYY-MM-DD format. Defaults to today.",
+    )
+    return parser.parse_args()
 
-    tickers = {
-        "SPY": "spy",
-        "QQQ": "qqq",
-        "COPPER": "cper",  # United States Copper Index Fund ETF
-    }
+
+def resolve_labels(raw_labels: List[str]) -> List[str]:
+    if not raw_labels:
+        return list(ASSET_CONFIG.keys())
+
+    labels = []
+    unknown = []
+    for label in raw_labels:
+        label_norm = label.upper()
+        if label_norm in ASSET_CONFIG:
+            labels.append(label_norm)
+        else:
+            unknown.append(label)
+
+    if unknown:
+        raise SystemExit(
+            f"Unknown label(s): {', '.join(unknown)}. "
+            f"Available: {', '.join(sorted(ASSET_CONFIG))}"
+        )
+
+    return labels
+
+
+def main():
+    args = parse_args()
+    end = date_type.fromisoformat(args.end_date)
+    labels = resolve_labels(args.labels)
 
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    for label, ticker in tickers.items():
+    for label in labels:
+        cfg = ASSET_CONFIG[label]
+        ticker = cfg["ticker"]
+        start = date_type.fromisoformat(cfg["start"])
         out_path = os.path.join(CACHE_DIR, f"{label}_5m.parquet")
         print(f"\n{'='*60}")
         print(f"Downloading {label} ({ticker}) 5m data: {start} -> {end}")
