@@ -54,6 +54,10 @@ class SweepConfig:
     entry_mode: str
     confirmation_bars: int
     entry_timeout_bars: int
+    min_volume_norm: float
+    trend_ma_days: int
+    aligned_scale: float
+    counter_scale: float
 
 
 def parse_csv_list(raw: str, cast):
@@ -96,6 +100,27 @@ def parse_args():
         default=6,
         help="How many bars after the setup a stop-confirm order can remain active before it expires.",
     )
+    parser.add_argument(
+        "--volume-thresholds",
+        default="0.0",
+        help="Minimum normalized volume required at entry confirmation. 0 disables the filter.",
+    )
+    parser.add_argument(
+        "--trend-ma-days",
+        type=int,
+        default=200,
+        help="Daily moving-average length used for side-based sizing. The MA is shifted by one full day to avoid lookahead.",
+    )
+    parser.add_argument(
+        "--aligned-scales",
+        default="1.0",
+        help="Position-size multipliers for trades aligned with the lagged daily trend MA.",
+    )
+    parser.add_argument(
+        "--counter-scales",
+        default="1.0",
+        help="Position-size multipliers for trades against the lagged daily trend MA.",
+    )
     parser.add_argument("--touch-tolerances", default="0.25,0.35")
     parser.add_argument("--break-buffer", type=float, default=0.15)
     parser.add_argument("--max-break-risk-pct", type=float, default=0.035)
@@ -121,7 +146,7 @@ def load_asset_5m(path: Path) -> pd.DataFrame:
     return df.sort_values("time").reset_index(drop=True)
 
 
-def resample_session_bars(df: pd.DataFrame, bar_minutes: int) -> pd.DataFrame:
+def resample_session_bars(df: pd.DataFrame, bar_minutes: int, trend_ma_days: int) -> pd.DataFrame:
     if bar_minutes % 5 != 0:
         raise ValueError("--bar-minutes must be divisible by 5")
 
@@ -149,6 +174,16 @@ def resample_session_bars(df: pd.DataFrame, bar_minutes: int) -> pd.DataFrame:
     grouped["time_et"] = grouped["time"].dt.tz_convert(NY_TZ)
     grouped["date_et"] = grouped["time_et"].dt.date
     grouped["weekday"] = grouped["time_et"].dt.day_name()
+    grouped["volume_per_5m"] = grouped["volume"] / grouped["raw_bars"].clip(lower=1)
+    bucket_baseline = grouped.groupby("bucket")["volume_per_5m"].transform(lambda s: s.shift(1).rolling(20, min_periods=5).median())
+    global_baseline = grouped["volume_per_5m"].shift(1).rolling(20, min_periods=5).median()
+    fallback_baseline = grouped["volume_per_5m"].replace(0.0, np.nan).expanding().median().shift(1)
+    grouped["volume_baseline"] = bucket_baseline.fillna(global_baseline).fillna(fallback_baseline)
+    grouped["volume_baseline"] = grouped["volume_baseline"].replace(0.0, np.nan)
+    grouped["volume_norm"] = (grouped["volume_per_5m"] / grouped["volume_baseline"]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    daily = grouped.groupby("date_et", as_index=False).agg(daily_close=("close", "last"))
+    daily["trend_ma_lag1"] = daily["daily_close"].rolling(max(1, trend_ma_days), min_periods=max(1, trend_ma_days)).mean().shift(1)
+    grouped = grouped.merge(daily[["date_et", "trend_ma_lag1"]], on="date_et", how="left")
     prev_close = grouped["close"].shift(1)
     tr = pd.concat(
         [
@@ -356,6 +391,8 @@ def precompute_touchline_model(
         "open": df["open"].to_numpy(dtype=float),
         "high": high,
         "low": low,
+        "volume_norm": df["volume_norm"].to_numpy(dtype=float),
+        "trend_ma_lag1": df["trend_ma_lag1"].to_numpy(dtype=float),
         "time": df["time"].to_numpy(),
         "time_et": df["time_et"].to_numpy(),
         "weekday": df["weekday"].to_numpy(),
@@ -645,16 +682,22 @@ def resolve_entry(
     high = model["high"]
     low = model["low"]
     atr = model["atr"]
+    volume_norm = model["volume_norm"]
     side = int(signal["side"])
     safety = signal["safety"]
 
     if cfg.entry_mode == "close":
+        setup_volume_norm = float(volume_norm[setup_idx])
+        if setup_volume_norm < cfg.min_volume_norm:
+            return None
         return {
             "entry_idx": int(setup_idx),
             "entry_price": float(close[setup_idx]),
             "confirmation_end_idx": int(setup_idx),
             "entry_trigger_price": float(close[setup_idx]),
             "entry_wait_bars": 0,
+            "confirmation_avg_volume_norm": setup_volume_norm,
+            "entry_volume_norm": setup_volume_norm,
         }
 
     last_idx = min(len(close) - 1, setup_idx + max(cfg.entry_timeout_bars, cfg.confirmation_bars))
@@ -680,6 +723,9 @@ def resolve_entry(
 
         confirm_end_idx = j
         confirm_start_idx = int(confirmation_start_idx) if confirmation_start_idx is not None else j - cfg.confirmation_bars + 1
+        confirm_avg_volume_norm = float(np.mean(volume_norm[confirm_start_idx : confirm_end_idx + 1]))
+        if confirm_avg_volume_norm < cfg.min_volume_norm:
+            continue
         trigger_price = float(np.max(high[confirm_start_idx : confirm_end_idx + 1])) if side == 1 else float(np.min(low[confirm_start_idx : confirm_end_idx + 1]))
 
         for k in range(confirm_end_idx + 1, last_idx + 1):
@@ -697,6 +743,8 @@ def resolve_entry(
                     "confirmation_end_idx": int(confirm_end_idx),
                     "entry_trigger_price": float(trigger_price),
                     "entry_wait_bars": int(k - setup_idx),
+                    "confirmation_avg_volume_norm": confirm_avg_volume_norm,
+                    "entry_volume_norm": float(volume_norm[k]),
                 }
         return None
 
@@ -713,6 +761,7 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
     weekday = model["weekday"]
     date_et = model["date_et"]
     bars_per_day = float(model["bars_per_day"])
+    trend_ma_lag1 = model["trend_ma_lag1"]
 
     trades = []
     warmup = int(model["min_week_bars"])
@@ -762,6 +811,15 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
         if initial_risk <= 0 or not np.isfinite(initial_risk):
             i += 1
             continue
+
+        entry_trend_ma = float(trend_ma_lag1[entry_idx]) if np.isfinite(trend_ma_lag1[entry_idx]) else np.nan
+        if np.isfinite(entry_trend_ma):
+            trend_aligned = (side == 1 and entry_price > entry_trend_ma) or (side == -1 and entry_price < entry_trend_ma)
+            position_scale = float(cfg.aligned_scale if trend_aligned else cfg.counter_scale)
+            trend_state = "aligned" if trend_aligned else "counter"
+        else:
+            position_scale = 1.0
+            trend_state = "unknown"
 
         exit_idx = None
         exit_reason = "end_of_data"
@@ -835,8 +893,10 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
             exit_idx = len(df) - 1
         safety_segments[-1]["end_idx"] = int(exit_idx)
 
-        return_pct = side * (exit_price / entry_price - 1.0)
-        r_multiple = side * (exit_price - entry_price) / initial_risk
+        raw_return_pct = side * (exit_price / entry_price - 1.0)
+        raw_r_multiple = side * (exit_price - entry_price) / initial_risk
+        return_pct = raw_return_pct * position_scale
+        r_multiple = raw_r_multiple * position_scale
 
         trades.append(
             {
@@ -864,9 +924,16 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
                 "confirmation_end_idx": int(entry_info["confirmation_end_idx"]),
                 "entry_trigger_price": float(entry_info["entry_trigger_price"]),
                 "entry_wait_bars": int(entry_info["entry_wait_bars"]),
+                "confirmation_avg_volume_norm": float(entry_info["confirmation_avg_volume_norm"]),
+                "entry_volume_norm": float(entry_info["entry_volume_norm"]),
+                "trend_ma_lag1": entry_trend_ma,
+                "trend_state": trend_state,
+                "position_scale": position_scale,
                 "initial_risk": initial_risk,
                 "risk_pct_of_entry": initial_risk / entry_price,
+                "raw_return_pct": raw_return_pct,
                 "return_pct": return_pct,
+                "raw_r_multiple": raw_r_multiple,
                 "r_multiple": r_multiple,
                 "exit_reason": exit_reason,
                 "hold_bars": int(exit_idx - entry_idx),
@@ -1162,7 +1229,7 @@ def plot_trade_detail(asset: str, df: pd.DataFrame, trade: pd.Series, out_path: 
         f"{asset} | trade {int(trade['trade_id'])} | {trade['setup']} {trade['side']}\n"
         f"entry {float(trade['entry_price']):.3f} | exit {float(trade['exit_price']):.3f} | "
         f"ret {float(trade['return_pct']) * 100:.2f}% | R {float(trade['r_multiple']):.2f} | "
-        f"touches {int(trade['touch_count'])}"
+        f"touches {int(trade['touch_count'])} | scale {float(trade.get('position_scale', 1.0)):.2f}x"
     )
     ax.text(
         0.99,
@@ -1205,9 +1272,12 @@ def iter_configs(args, assets: Iterable[str]) -> list[SweepConfig]:
     stop_buffers = parse_csv_list(args.stop_buffers, float)
     take_profits = parse_csv_list(args.take_profits, float) if args.use_take_profit else [0.0]
     touch_tolerances = parse_csv_list(args.touch_tolerances, float)
+    volume_thresholds = parse_csv_list(args.volume_thresholds, float)
+    aligned_scales = parse_csv_list(args.aligned_scales, float)
+    counter_scales = parse_csv_list(args.counter_scales, float)
 
     configs = []
-    for asset, recent, min_touches, slope_th, stop_buffer, take_profit, touch_tol in itertools.product(
+    for asset, recent, min_touches, slope_th, stop_buffer, take_profit, touch_tol, volume_th, aligned_scale, counter_scale in itertools.product(
         assets,
         recent_pivots,
         touch_options,
@@ -1215,6 +1285,9 @@ def iter_configs(args, assets: Iterable[str]) -> list[SweepConfig]:
         stop_buffers,
         take_profits,
         touch_tolerances,
+        volume_thresholds,
+        aligned_scales,
+        counter_scales,
     ):
         configs.append(
             SweepConfig(
@@ -1232,6 +1305,10 @@ def iter_configs(args, assets: Iterable[str]) -> list[SweepConfig]:
                 entry_mode=str(args.entry_mode),
                 confirmation_bars=max(1, int(args.confirmation_bars)),
                 entry_timeout_bars=max(1, int(args.entry_timeout_bars)),
+                min_volume_norm=float(volume_th),
+                trend_ma_days=max(1, int(args.trend_ma_days)),
+                aligned_scale=float(aligned_scale),
+                counter_scale=float(counter_scale),
             )
         )
     return configs
@@ -1255,7 +1332,7 @@ def main():
     baseline_rows = []
 
     for asset in assets:
-        df = resample_session_bars(load_asset_5m(ASSET_PATHS[asset]), args.bar_minutes)
+        df = resample_session_bars(load_asset_5m(ASSET_PATHS[asset]), args.bar_minutes, args.trend_ma_days)
         prepared_assets[asset] = df
         baseline_rows.append(
             {
