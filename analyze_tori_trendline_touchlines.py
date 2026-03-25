@@ -51,6 +51,9 @@ class SweepConfig:
     break_buffer: float
     max_break_risk_pct: float
     use_take_profit: bool
+    entry_mode: str
+    confirmation_bars: int
+    entry_timeout_bars: int
 
 
 def parse_csv_list(raw: str, cast):
@@ -74,6 +77,24 @@ def parse_args():
         "--use-take-profit",
         action="store_true",
         help="Enable fixed R-multiple take profits. Default behavior is trail-only on the safety line.",
+    )
+    parser.add_argument(
+        "--entry-mode",
+        choices=["close", "stop_confirm"],
+        default="close",
+        help="Entry execution style. 'close' enters on the signal bar close; 'stop_confirm' waits for directional confirmation and enters on a stop order.",
+    )
+    parser.add_argument(
+        "--confirmation-bars",
+        type=int,
+        default=2,
+        help="Number of same-direction candles required for stop_confirm entries. The signal bar can count as the first confirmation candle.",
+    )
+    parser.add_argument(
+        "--entry-timeout-bars",
+        type=int,
+        default=6,
+        help="How many bars after the setup a stop-confirm order can remain active before it expires.",
     )
     parser.add_argument("--touch-tolerances", default="0.25,0.35")
     parser.add_argument("--break-buffer", type=float, default=0.15)
@@ -607,6 +628,81 @@ def parse_safety_segments(trade: pd.Series) -> list[dict] | None:
     return parsed if isinstance(parsed, list) and parsed else None
 
 
+def is_confirmation_candle(side: int, open_price: float, close_price: float) -> bool:
+    if side == 1:
+        return close_price >= open_price
+    return close_price <= open_price
+
+
+def resolve_entry(
+    setup_idx: int,
+    signal: dict,
+    model: dict,
+    cfg: SweepConfig,
+) -> dict | None:
+    close = model["close"]
+    open_ = model["open"]
+    high = model["high"]
+    low = model["low"]
+    atr = model["atr"]
+    side = int(signal["side"])
+    safety = signal["safety"]
+
+    if cfg.entry_mode == "close":
+        return {
+            "entry_idx": int(setup_idx),
+            "entry_price": float(close[setup_idx]),
+            "confirmation_end_idx": int(setup_idx),
+            "entry_trigger_price": float(close[setup_idx]),
+            "entry_wait_bars": 0,
+        }
+
+    last_idx = min(len(close) - 1, setup_idx + max(cfg.entry_timeout_bars, cfg.confirmation_bars))
+    consecutive = 0
+    confirmation_start_idx = None
+
+    for j in range(setup_idx, last_idx + 1):
+        safety_line_now = float(line_value(safety["anchor1_idx"], safety["anchor1_price"], safety["slope"], j))
+        invalidated = close[j] <= safety_line_now - cfg.stop_buffer * atr[j] if side == 1 else close[j] >= safety_line_now + cfg.stop_buffer * atr[j]
+        if invalidated:
+            return None
+
+        if is_confirmation_candle(side, float(open_[j]), float(close[j])):
+            consecutive += 1
+            if consecutive == 1:
+                confirmation_start_idx = j
+        else:
+            consecutive = 0
+            confirmation_start_idx = None
+
+        if consecutive < cfg.confirmation_bars:
+            continue
+
+        confirm_end_idx = j
+        confirm_start_idx = int(confirmation_start_idx) if confirmation_start_idx is not None else j - cfg.confirmation_bars + 1
+        trigger_price = float(np.max(high[confirm_start_idx : confirm_end_idx + 1])) if side == 1 else float(np.min(low[confirm_start_idx : confirm_end_idx + 1]))
+
+        for k in range(confirm_end_idx + 1, last_idx + 1):
+            safety_line_k = float(line_value(safety["anchor1_idx"], safety["anchor1_price"], safety["slope"], k))
+            invalidated_k = close[k] <= safety_line_k - cfg.stop_buffer * atr[k] if side == 1 else close[k] >= safety_line_k + cfg.stop_buffer * atr[k]
+            triggered = high[k] >= trigger_price if side == 1 else low[k] <= trigger_price
+            if invalidated_k and not triggered:
+                return None
+            if triggered:
+                if invalidated_k:
+                    return None
+                return {
+                    "entry_idx": int(k),
+                    "entry_price": float(trigger_price),
+                    "confirmation_end_idx": int(confirm_end_idx),
+                    "entry_trigger_price": float(trigger_price),
+                    "entry_wait_bars": int(k - setup_idx),
+                }
+        return None
+
+    return None
+
+
 def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataFrame:
     close = model["close"]
     high = model["high"]
@@ -632,8 +728,14 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
         safety = signal["safety"]
         current_safety = dict(safety)
         side = int(signal["side"])
-        entry_idx = i
-        entry_price = float(close[entry_idx])
+        setup_idx = i
+        entry_info = resolve_entry(setup_idx, signal, model, cfg)
+        if entry_info is None:
+            i += 1
+            continue
+
+        entry_idx = int(entry_info["entry_idx"])
+        entry_price = float(entry_info["entry_price"])
         safety_segments = [
             {
                 "start_idx": int(entry_idx),
@@ -739,10 +841,13 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
         trades.append(
             {
                 **asdict(cfg),
+                "setup_time_utc": pd.Timestamp(time[setup_idx]),
+                "setup_time_et": pd.Timestamp(time_et[setup_idx]),
                 "entry_time_utc": pd.Timestamp(time[entry_idx]),
                 "exit_time_utc": pd.Timestamp(time[exit_idx]),
                 "entry_time_et": pd.Timestamp(time_et[entry_idx]),
                 "exit_time_et": pd.Timestamp(time_et[exit_idx]),
+                "setup_bar_idx": int(setup_idx),
                 "entry_date_et": date_et[entry_idx],
                 "exit_date_et": date_et[exit_idx],
                 "entry_weekday": weekday[entry_idx],
@@ -756,6 +861,9 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
                 "take_profit_price": take_profit,
                 "entry_bar_idx": int(entry_idx),
                 "exit_bar_idx": int(exit_idx),
+                "confirmation_end_idx": int(entry_info["confirmation_end_idx"]),
+                "entry_trigger_price": float(entry_info["entry_trigger_price"]),
+                "entry_wait_bars": int(entry_info["entry_wait_bars"]),
                 "initial_risk": initial_risk,
                 "risk_pct_of_entry": initial_risk / entry_price,
                 "return_pct": return_pct,
@@ -770,7 +878,8 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
                 "action_anchor2_price": float(action["anchor2_price"]),
                 "action_slope": float(action["slope"]),
                 "action_slope_pct": float(action["slope_pct"]),
-                "action_line_entry": float(action["line_now"]),
+                "action_line_setup": float(action["line_now"]),
+                "action_line_entry": float(line_value(action["anchor1_idx"], action["anchor1_price"], action["slope"], entry_idx)),
                 "action_touch_count": int(action["touch_count"]),
                 "safety_kind": safety["kind"],
                 "safety_anchor1_idx": int(safety["anchor1_idx"]),
@@ -779,6 +888,7 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
                 "safety_anchor2_price": float(safety["anchor2_price"]),
                 "safety_slope": float(safety["slope"]),
                 "safety_slope_pct": float(safety["slope_pct"]),
+                "safety_line_setup": float(safety["line_now"]),
                 "safety_line_entry": float(line_value(safety["anchor1_idx"], safety["anchor1_price"], safety["slope"], entry_idx)),
                 "safety_touch_count": int(safety["touch_count"]),
                 "final_safety_anchor1_idx": int(current_safety["anchor1_idx"]),
@@ -837,10 +947,11 @@ def summarize_trades(trades: pd.DataFrame, buy_hold_return: float, min_trades: i
     cagr = (1.0 + total_return) ** (1.0 / years) - 1.0 if total_return > -1.0 else -1.0
     outperformance = total_return - buy_hold_return
     trade_count = int(len(trades))
+    avg_r_multiple = float(trades["r_multiple"].mean())
     quality_score = (
         total_return
         + 0.25 * np.tanh(profit_factor if np.isfinite(profit_factor) else 5.0)
-        + 0.10 * float(trades["r_multiple"].mean())
+        + 0.10 * np.tanh(avg_r_multiple / 5.0)
         - 0.60 * abs(max_drawdown)
     )
     if trade_count < min_trades:
@@ -855,7 +966,7 @@ def summarize_trades(trades: pd.DataFrame, buy_hold_return: float, min_trades: i
         "win_rate": float((trades["return_pct"] > 0).mean()),
         "avg_return_pct": float(trades["return_pct"].mean()),
         "median_return_pct": float(trades["return_pct"].median()),
-        "avg_r_multiple": float(trades["r_multiple"].mean()),
+        "avg_r_multiple": avg_r_multiple,
         "profit_factor": float(profit_factor),
         "total_return": total_return,
         "cagr": float(cagr),
@@ -1118,6 +1229,9 @@ def iter_configs(args, assets: Iterable[str]) -> list[SweepConfig]:
                 break_buffer=args.break_buffer,
                 max_break_risk_pct=args.max_break_risk_pct,
                 use_take_profit=bool(args.use_take_profit),
+                entry_mode=str(args.entry_mode),
+                confirmation_bars=max(1, int(args.confirmation_bars)),
+                entry_timeout_bars=max(1, int(args.entry_timeout_bars)),
             )
         )
     return configs
