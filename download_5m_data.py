@@ -35,10 +35,11 @@ def _pace():
 ASSET_CONFIG: Dict[str, Dict[str, str]] = {
     "SPY": {"ticker": "spy", "start": "2021-03-12"},
     "QQQ": {"ticker": "qqq", "start": "2021-03-12"},
-    "COPPER": {"ticker": "cper", "start": "2021-03-12"},
+    "COPPER": {"ticker": "cper", "start": "2017-01-03"},
     # Tiingo IEX intraday history for these proxies starts in early 2017.
     "UUP": {"ticker": "uup", "start": "2017-01-03"},
     "XAU": {"ticker": "gld", "start": "2017-01-03"},
+    "XAG": {"ticker": "slv", "start": "2017-01-03"},
 }
 
 

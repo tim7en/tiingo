@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import json
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -406,6 +407,60 @@ def pick_best_resistance_for_short_break(resistance_candidates: list[dict], pric
     return eligible[0]
 
 
+def maybe_promote_safety_line(
+    current_safety: dict,
+    side: int,
+    idx: int,
+    model: dict,
+    cfg: SweepConfig,
+    entry_idx: int,
+) -> dict | None:
+    close = model["close"]
+    atr = model["atr"]
+    latest_anchor = max(entry_idx, int(current_safety["anchor2_idx"]))
+
+    if side == 1:
+        current_stop = float(line_value(current_safety["anchor1_idx"], current_safety["anchor1_price"], current_safety["slope"], idx) - cfg.stop_buffer * atr[idx])
+        eligible: list[tuple[float, int, int, dict]] = []
+        for cand in model["support_candidates"][idx]:
+            if cand["touch_count"] < 2:
+                continue
+            if cand["line_now"] >= close[idx]:
+                continue
+            if cand["slope_pct"] < -(cfg.slope_threshold / 2.0):
+                continue
+            if int(cand["anchor2_idx"]) <= latest_anchor:
+                continue
+            proposed_stop = float(line_value(cand["anchor1_idx"], cand["anchor1_price"], cand["slope"], idx) - cfg.stop_buffer * atr[idx])
+            if proposed_stop <= current_stop + 1e-12:
+                continue
+            eligible.append((proposed_stop, int(cand["touch_count"]), int(cand["anchor2_idx"]), cand))
+        if not eligible:
+            return None
+        eligible.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return eligible[0][3]
+
+    current_stop = float(line_value(current_safety["anchor1_idx"], current_safety["anchor1_price"], current_safety["slope"], idx) + cfg.stop_buffer * atr[idx])
+    eligible = []
+    for cand in model["resistance_candidates"][idx]:
+        if cand["touch_count"] < 2:
+            continue
+        if cand["line_now"] <= close[idx]:
+            continue
+        if cand["slope_pct"] > (cfg.slope_threshold / 2.0):
+            continue
+        if int(cand["anchor2_idx"]) <= latest_anchor:
+            continue
+        proposed_stop = float(line_value(cand["anchor1_idx"], cand["anchor1_price"], cand["slope"], idx) + cfg.stop_buffer * atr[idx])
+        if proposed_stop >= current_stop - 1e-12:
+            continue
+        eligible.append((proposed_stop, int(cand["touch_count"]), int(cand["anchor2_idx"]), cand))
+    if not eligible:
+        return None
+    eligible.sort(key=lambda item: (item[0], -item[1], -item[2]))
+    return eligible[0][3]
+
+
 def build_signals_for_bar(i: int, model: dict, cfg: SweepConfig) -> list[dict]:
     support_candidates = model["support_candidates"][i]
     resistance_candidates = model["resistance_candidates"][i]
@@ -524,6 +579,34 @@ def line_from_trade(trade: pd.Series, prefix: str, idx: int | np.ndarray) -> np.
     )
 
 
+def line_from_segments(segments: list[dict], idx: np.ndarray) -> np.ndarray:
+    values = np.full(len(idx), np.nan, dtype=float)
+    for segment in segments:
+        start_idx = int(segment["start_idx"])
+        end_idx = int(segment["end_idx"])
+        mask = (idx >= start_idx) & (idx <= end_idx)
+        if not np.any(mask):
+            continue
+        values[mask] = line_value(
+            anchor_idx=int(segment["anchor1_idx"]),
+            anchor_price=float(segment["anchor1_price"]),
+            slope=float(segment["slope"]),
+            idx=idx[mask],
+        )
+    return values
+
+
+def parse_safety_segments(trade: pd.Series) -> list[dict] | None:
+    raw = trade.get("safety_path", "")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, list) and parsed else None
+
+
 def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataFrame:
     close = model["close"]
     high = model["high"]
@@ -547,16 +630,30 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
         signal = signals[0]
         action = signal["action"]
         safety = signal["safety"]
+        current_safety = dict(safety)
         side = int(signal["side"])
         entry_idx = i
         entry_price = float(close[entry_idx])
+        safety_segments = [
+            {
+                "start_idx": int(entry_idx),
+                "end_idx": None,
+                "kind": str(current_safety["kind"]),
+                "anchor1_idx": int(current_safety["anchor1_idx"]),
+                "anchor2_idx": int(current_safety["anchor2_idx"]),
+                "anchor1_price": float(current_safety["anchor1_price"]),
+                "anchor2_price": float(current_safety["anchor2_price"]),
+                "slope": float(current_safety["slope"]),
+                "touch_count": int(current_safety["touch_count"]),
+            }
+        ]
 
         if side == 1:
-            initial_stop = float(line_value(safety["anchor1_idx"], safety["anchor1_price"], safety["slope"], entry_idx) - cfg.stop_buffer * atr[entry_idx])
+            initial_stop = float(line_value(current_safety["anchor1_idx"], current_safety["anchor1_price"], current_safety["slope"], entry_idx) - cfg.stop_buffer * atr[entry_idx])
             initial_risk = entry_price - initial_stop
             take_profit = entry_price + cfg.take_profit_r * initial_risk if cfg.use_take_profit and cfg.take_profit_r > 0 else np.nan
         else:
-            initial_stop = float(line_value(safety["anchor1_idx"], safety["anchor1_price"], safety["slope"], entry_idx) + cfg.stop_buffer * atr[entry_idx])
+            initial_stop = float(line_value(current_safety["anchor1_idx"], current_safety["anchor1_price"], current_safety["slope"], entry_idx) + cfg.stop_buffer * atr[entry_idx])
             initial_risk = initial_stop - entry_price
             take_profit = entry_price - cfg.take_profit_r * initial_risk if cfg.use_take_profit and cfg.take_profit_r > 0 else np.nan
 
@@ -572,7 +669,7 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
 
         j = entry_idx + 1
         while j < len(df):
-            safety_line_now = float(line_value(safety["anchor1_idx"], safety["anchor1_price"], safety["slope"], j))
+            safety_line_now = float(line_value(current_safety["anchor1_idx"], current_safety["anchor1_price"], current_safety["slope"], j))
             if side == 1:
                 stop_level = safety_line_now - cfg.stop_buffer * atr[j]
                 move_favorable = (high[j] - entry_price) / initial_risk
@@ -605,10 +702,36 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
                 exit_reason = "take_profit"
                 exit_idx = j
                 break
+            if signal["setup"] == "break":
+                promoted = maybe_promote_safety_line(
+                    current_safety=current_safety,
+                    side=side,
+                    idx=j,
+                    model=model,
+                    cfg=cfg,
+                    entry_idx=entry_idx,
+                )
+                if promoted is not None and j + 1 < len(df):
+                    safety_segments[-1]["end_idx"] = int(j)
+                    current_safety = dict(promoted)
+                    safety_segments.append(
+                        {
+                            "start_idx": int(j + 1),
+                            "end_idx": None,
+                            "kind": str(current_safety["kind"]),
+                            "anchor1_idx": int(current_safety["anchor1_idx"]),
+                            "anchor2_idx": int(current_safety["anchor2_idx"]),
+                            "anchor1_price": float(current_safety["anchor1_price"]),
+                            "anchor2_price": float(current_safety["anchor2_price"]),
+                            "slope": float(current_safety["slope"]),
+                            "touch_count": int(current_safety["touch_count"]),
+                        }
+                    )
             j += 1
 
         if exit_idx is None:
             exit_idx = len(df) - 1
+        safety_segments[-1]["end_idx"] = int(exit_idx)
 
         return_pct = side * (exit_price / entry_price - 1.0)
         r_multiple = side * (exit_price - entry_price) / initial_risk
@@ -658,6 +781,14 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
                 "safety_slope_pct": float(safety["slope_pct"]),
                 "safety_line_entry": float(line_value(safety["anchor1_idx"], safety["anchor1_price"], safety["slope"], entry_idx)),
                 "safety_touch_count": int(safety["touch_count"]),
+                "final_safety_anchor1_idx": int(current_safety["anchor1_idx"]),
+                "final_safety_anchor2_idx": int(current_safety["anchor2_idx"]),
+                "final_safety_anchor1_price": float(current_safety["anchor1_price"]),
+                "final_safety_anchor2_price": float(current_safety["anchor2_price"]),
+                "final_safety_slope": float(current_safety["slope"]),
+                "final_safety_touch_count": int(current_safety["touch_count"]),
+                "safety_update_count": int(max(0, len(safety_segments) - 1)),
+                "safety_path": json.dumps(safety_segments, separators=(",", ":")),
                 "mfe_r": float(peak_favorable),
                 "mae_r": float(peak_adverse),
             }
@@ -850,7 +981,11 @@ def plot_trade_detail(asset: str, df: pd.DataFrame, trade: pd.Series, out_path: 
     exit_idx = int(trade["exit_bar_idx"])
     context = 12
     post_bars = 6
-    start_idx = max(0, min(int(trade["action_anchor1_idx"]), int(trade["safety_anchor1_idx"]), entry_idx) - context)
+    safety_segments = parse_safety_segments(trade)
+    min_safety_anchor = int(trade["safety_anchor1_idx"])
+    if safety_segments:
+        min_safety_anchor = min(int(segment["anchor1_idx"]) for segment in safety_segments)
+    start_idx = max(0, min(int(trade["action_anchor1_idx"]), min_safety_anchor, entry_idx) - context)
     end_idx = min(len(df) - 1, exit_idx + post_bars)
 
     frame = df.iloc[start_idx : end_idx + 1][["time_et", "open", "high", "low", "close"]].copy()
@@ -858,7 +993,10 @@ def plot_trade_detail(asset: str, df: pd.DataFrame, trade: pd.Series, out_path: 
     frame["time_plot"] = pd.to_datetime(frame["time_et"]).dt.tz_localize(None)
     frame["x"] = np.arange(len(frame), dtype=float)
     frame["action_line"] = line_from_trade(trade, "action", frame["bar_idx"].to_numpy())
-    frame["safety_line"] = line_from_trade(trade, "safety", frame["bar_idx"].to_numpy())
+    if safety_segments:
+        frame["safety_line"] = line_from_segments(safety_segments, frame["bar_idx"].to_numpy())
+    else:
+        frame["safety_line"] = line_from_trade(trade, "safety", frame["bar_idx"].to_numpy())
     frame["take_profit"] = float(trade["take_profit_price"])
 
     fig, ax = plt.subplots(figsize=(15, 7))
@@ -876,13 +1014,33 @@ def plot_trade_detail(asset: str, df: pd.DataFrame, trade: pd.Series, out_path: 
     ax.scatter([entry_x], [float(trade["entry_price"])], marker=entry_marker, s=120, color="#1d4ed8", edgecolor="white", linewidth=0.8, zorder=6, label="Entry")
     ax.scatter([exit_x], [float(trade["exit_price"])], marker="X", s=110, color="#111827", edgecolor="white", linewidth=0.8, zorder=6, label="Exit")
 
-    for prefix, color, marker in [("action", "#dc2626", "o"), ("safety", "#16a34a", "s")]:
+    for prefix, color, marker in [("action", "#dc2626", "o")]:
         for anchor_num in [1, 2]:
             anchor_idx = int(trade[f"{prefix}_anchor{anchor_num}_idx"])
             if start_idx <= anchor_idx <= end_idx:
                 anchor_x = float(anchor_idx - start_idx)
                 anchor_price = float(trade[f"{prefix}_anchor{anchor_num}_price"])
                 ax.scatter([anchor_x], [anchor_price], marker=marker, s=40, color=color, edgecolor="white", linewidth=0.6, zorder=6)
+
+    seen_safety_anchors: set[tuple[int, float]] = set()
+    if safety_segments:
+        for segment in safety_segments:
+            for anchor_key in [("anchor1_idx", "anchor1_price"), ("anchor2_idx", "anchor2_price")]:
+                anchor_idx = int(segment[anchor_key[0]])
+                anchor_price = float(segment[anchor_key[1]])
+                marker_key = (anchor_idx, anchor_price)
+                if marker_key in seen_safety_anchors or not (start_idx <= anchor_idx <= end_idx):
+                    continue
+                seen_safety_anchors.add(marker_key)
+                anchor_x = float(anchor_idx - start_idx)
+                ax.scatter([anchor_x], [anchor_price], marker="s", s=40, color="#16a34a", edgecolor="white", linewidth=0.6, zorder=6)
+    else:
+        for anchor_num in [1, 2]:
+            anchor_idx = int(trade[f"safety_anchor{anchor_num}_idx"])
+            if start_idx <= anchor_idx <= end_idx:
+                anchor_x = float(anchor_idx - start_idx)
+                anchor_price = float(trade[f"safety_anchor{anchor_num}_price"])
+                ax.scatter([anchor_x], [anchor_price], marker="s", s=40, color="#16a34a", edgecolor="white", linewidth=0.6, zorder=6)
 
     ax.axvspan(entry_x, exit_x, color="#93c5fd", alpha=0.10, zorder=1)
 
