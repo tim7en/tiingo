@@ -58,6 +58,10 @@ class SweepConfig:
     trend_ma_days: int
     aligned_scale: float
     counter_scale: float
+    volume_trend_lookback: int
+    volume_trend_threshold: float
+    high_volume_scale: float
+    low_volume_scale: float
 
 
 def parse_csv_list(raw: str, cast):
@@ -121,6 +125,27 @@ def parse_args():
         default="1.0",
         help="Position-size multipliers for trades against the lagged daily trend MA.",
     )
+    parser.add_argument(
+        "--volume-trend-lookback",
+        type=int,
+        default=5,
+        help="Rolling lookback, in strategy bars, for lagged normalized-volume trend sizing.",
+    )
+    parser.add_argument(
+        "--volume-trend-thresholds",
+        default="1.0",
+        help="Thresholds for lagged volume-trend scaling. Values above the threshold are treated as high-volume regimes.",
+    )
+    parser.add_argument(
+        "--high-volume-scales",
+        default="1.0",
+        help="Position-size multipliers for trades entered during lagged high-volume regimes.",
+    )
+    parser.add_argument(
+        "--low-volume-scales",
+        default="1.0",
+        help="Position-size multipliers for trades entered during lagged lower-volume regimes.",
+    )
     parser.add_argument("--touch-tolerances", default="0.25,0.35")
     parser.add_argument("--break-buffer", type=float, default=0.15)
     parser.add_argument("--max-break-risk-pct", type=float, default=0.035)
@@ -146,7 +171,7 @@ def load_asset_5m(path: Path) -> pd.DataFrame:
     return df.sort_values("time").reset_index(drop=True)
 
 
-def resample_session_bars(df: pd.DataFrame, bar_minutes: int, trend_ma_days: int) -> pd.DataFrame:
+def resample_session_bars(df: pd.DataFrame, bar_minutes: int, trend_ma_days: int, volume_trend_lookback: int) -> pd.DataFrame:
     if bar_minutes % 5 != 0:
         raise ValueError("--bar-minutes must be divisible by 5")
 
@@ -181,6 +206,9 @@ def resample_session_bars(df: pd.DataFrame, bar_minutes: int, trend_ma_days: int
     grouped["volume_baseline"] = bucket_baseline.fillna(global_baseline).fillna(fallback_baseline)
     grouped["volume_baseline"] = grouped["volume_baseline"].replace(0.0, np.nan)
     grouped["volume_norm"] = (grouped["volume_per_5m"] / grouped["volume_baseline"]).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    lookback = max(1, int(volume_trend_lookback))
+    min_periods = min(3, lookback)
+    grouped["volume_trend_lag1"] = grouped["volume_norm"].shift(1).rolling(lookback, min_periods=min_periods).mean()
     daily = grouped.groupby("date_et", as_index=False).agg(daily_close=("close", "last"))
     daily["trend_ma_lag1"] = daily["daily_close"].rolling(max(1, trend_ma_days), min_periods=max(1, trend_ma_days)).mean().shift(1)
     grouped = grouped.merge(daily[["date_et", "trend_ma_lag1"]], on="date_et", how="left")
@@ -392,6 +420,7 @@ def precompute_touchline_model(
         "high": high,
         "low": low,
         "volume_norm": df["volume_norm"].to_numpy(dtype=float),
+        "volume_trend_lag1": df["volume_trend_lag1"].to_numpy(dtype=float),
         "trend_ma_lag1": df["trend_ma_lag1"].to_numpy(dtype=float),
         "time": df["time"].to_numpy(),
         "time_et": df["time_et"].to_numpy(),
@@ -761,6 +790,7 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
     weekday = model["weekday"]
     date_et = model["date_et"]
     bars_per_day = float(model["bars_per_day"])
+    volume_trend_lag1 = model["volume_trend_lag1"]
     trend_ma_lag1 = model["trend_ma_lag1"]
 
     trades = []
@@ -815,11 +845,21 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
         entry_trend_ma = float(trend_ma_lag1[entry_idx]) if np.isfinite(trend_ma_lag1[entry_idx]) else np.nan
         if np.isfinite(entry_trend_ma):
             trend_aligned = (side == 1 and entry_price > entry_trend_ma) or (side == -1 and entry_price < entry_trend_ma)
-            position_scale = float(cfg.aligned_scale if trend_aligned else cfg.counter_scale)
+            ma_scale = float(cfg.aligned_scale if trend_aligned else cfg.counter_scale)
             trend_state = "aligned" if trend_aligned else "counter"
         else:
-            position_scale = 1.0
+            ma_scale = 1.0
             trend_state = "unknown"
+
+        entry_volume_trend = float(volume_trend_lag1[entry_idx]) if np.isfinite(volume_trend_lag1[entry_idx]) else np.nan
+        if np.isfinite(entry_volume_trend):
+            high_volume_regime = entry_volume_trend >= cfg.volume_trend_threshold
+            volume_scale = float(cfg.high_volume_scale if high_volume_regime else cfg.low_volume_scale)
+            volume_state = "high" if high_volume_regime else "low"
+        else:
+            volume_scale = 1.0
+            volume_state = "unknown"
+        position_scale = ma_scale * volume_scale
 
         exit_idx = None
         exit_reason = "end_of_data"
@@ -928,6 +968,10 @@ def simulate_config(df: pd.DataFrame, model: dict, cfg: SweepConfig) -> pd.DataF
                 "entry_volume_norm": float(entry_info["entry_volume_norm"]),
                 "trend_ma_lag1": entry_trend_ma,
                 "trend_state": trend_state,
+                "ma_scale": ma_scale,
+                "volume_trend_lag1": entry_volume_trend,
+                "volume_state": volume_state,
+                "volume_scale": volume_scale,
                 "position_scale": position_scale,
                 "initial_risk": initial_risk,
                 "risk_pct_of_entry": initial_risk / entry_price,
@@ -1275,9 +1319,12 @@ def iter_configs(args, assets: Iterable[str]) -> list[SweepConfig]:
     volume_thresholds = parse_csv_list(args.volume_thresholds, float)
     aligned_scales = parse_csv_list(args.aligned_scales, float)
     counter_scales = parse_csv_list(args.counter_scales, float)
+    volume_trend_thresholds = parse_csv_list(args.volume_trend_thresholds, float)
+    high_volume_scales = parse_csv_list(args.high_volume_scales, float)
+    low_volume_scales = parse_csv_list(args.low_volume_scales, float)
 
     configs = []
-    for asset, recent, min_touches, slope_th, stop_buffer, take_profit, touch_tol, volume_th, aligned_scale, counter_scale in itertools.product(
+    for asset, recent, min_touches, slope_th, stop_buffer, take_profit, touch_tol, volume_th, aligned_scale, counter_scale, volume_trend_threshold, high_volume_scale, low_volume_scale in itertools.product(
         assets,
         recent_pivots,
         touch_options,
@@ -1288,6 +1335,9 @@ def iter_configs(args, assets: Iterable[str]) -> list[SweepConfig]:
         volume_thresholds,
         aligned_scales,
         counter_scales,
+        volume_trend_thresholds,
+        high_volume_scales,
+        low_volume_scales,
     ):
         configs.append(
             SweepConfig(
@@ -1309,6 +1359,10 @@ def iter_configs(args, assets: Iterable[str]) -> list[SweepConfig]:
                 trend_ma_days=max(1, int(args.trend_ma_days)),
                 aligned_scale=float(aligned_scale),
                 counter_scale=float(counter_scale),
+                volume_trend_lookback=max(1, int(args.volume_trend_lookback)),
+                volume_trend_threshold=float(volume_trend_threshold),
+                high_volume_scale=float(high_volume_scale),
+                low_volume_scale=float(low_volume_scale),
             )
         )
     return configs
@@ -1332,7 +1386,12 @@ def main():
     baseline_rows = []
 
     for asset in assets:
-        df = resample_session_bars(load_asset_5m(ASSET_PATHS[asset]), args.bar_minutes, args.trend_ma_days)
+        df = resample_session_bars(
+            load_asset_5m(ASSET_PATHS[asset]),
+            args.bar_minutes,
+            args.trend_ma_days,
+            args.volume_trend_lookback,
+        )
         prepared_assets[asset] = df
         baseline_rows.append(
             {
