@@ -59,7 +59,8 @@ ASSET_CONFIG: Dict[str, Dict[str, str]] = {
     "PLTR": {"ticker": "pltr", "source": "iex", "start": "2021-03-30"},
     "META": {"ticker": "meta", "source": "iex", "start": "2021-03-30"},
     "MSTR": {"ticker": "mstr", "source": "iex", "start": "2021-03-30"},
-    "CRCL": {"ticker": "crcl", "source": "iex", "start": "2021-03-30"},
+    # Circle began trading on the NYSE on 2025-06-05, so earlier requests are guaranteed empty.
+    "CRCL": {"ticker": "crcl", "source": "iex", "start": "2025-06-05"},
     "HOOD": {"ticker": "hood", "source": "iex", "start": "2021-03-30"},
     "COIN": {"ticker": "coin", "source": "iex", "start": "2021-03-30"},
 }
@@ -265,6 +266,11 @@ def parse_args():
         default=REQUEST_GAP_SEC,
         help="Seconds to wait between Tiingo requests. Lower values are faster but may trigger rate limiting.",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip labels whose cache parquet already exists.",
+    )
     return parser.parse_args()
 
 
@@ -305,6 +311,9 @@ def main():
         source = cfg["source"]
         start = date_type.fromisoformat(cfg["start"])
         out_path = os.path.join(CACHE_DIR, f"{label}_5m.parquet")
+        if args.skip_existing and os.path.exists(out_path):
+            print(f"\nSkipping {label}: cache already exists at {out_path}")
+            continue
         print(f"\n{'='*60}")
         print(f"Downloading {label} ({ticker}, {source}) 5m data: {start} -> {end}")
         print(f"{'='*60}")
