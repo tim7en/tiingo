@@ -30,12 +30,16 @@ CACHE_DIR = ROOT / "cache"
 RESULTS_DIR = ROOT / "results" / "tori_trendline_touchlines"
 NY_TZ = ZoneInfo("America/New_York")
 
-ASSET_PATHS = {
-    "XAU": CACHE_DIR / "XAU_5m.parquet",
-    "XAG": CACHE_DIR / "XAG_5m.parquet",
-    "COPPER": CACHE_DIR / "COPPER_5m.parquet",
-    "UUP": CACHE_DIR / "UUP_5m.parquet",
-}
+def asset_cache_path(asset: str) -> Path:
+    return CACHE_DIR / f"{asset.upper()}_5m.parquet"
+
+
+def available_asset_labels() -> list[str]:
+    labels = []
+    for path in CACHE_DIR.glob("*_5m.parquet"):
+        if path.stem.endswith("_5m"):
+            labels.append(path.stem[:-3].upper())
+    return sorted(set(labels))
 
 
 @dataclass(frozen=True)
@@ -1374,9 +1378,10 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     assets = [asset.strip().upper() for asset in args.assets.split(",") if asset.strip()]
-    unknown = [asset for asset in assets if asset not in ASSET_PATHS]
+    asset_paths = {asset: asset_cache_path(asset) for asset in assets}
+    unknown = [asset for asset, path in asset_paths.items() if not path.exists()]
     if unknown:
-        raise ValueError(f"Unsupported assets: {unknown}. Supported: {sorted(ASSET_PATHS)}")
+        raise ValueError(f"Missing cache files for assets: {unknown}. Available: {available_asset_labels()}")
 
     max_touch_tolerance = max(parse_csv_list(args.touch_tolerances, float))
     recent_pivots_values = sorted(set(parse_csv_list(args.recent_pivots, int)))
@@ -1387,7 +1392,7 @@ def main():
 
     for asset in assets:
         df = resample_session_bars(
-            load_asset_5m(ASSET_PATHS[asset]),
+            load_asset_5m(asset_paths[asset]),
             args.bar_minutes,
             args.trend_ma_days,
             args.volume_trend_lookback,

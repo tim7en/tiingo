@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Download long-range 5-minute kline data from Tiingo IEX into the local cache."""
+"""Download long-range 5-minute bars from Tiingo into the local cache."""
 
 import argparse
-import requests
-import pandas as pd
-from datetime import datetime, timedelta, date as date_type
-import time
 import os
+import time
+from datetime import date as date_type
+from datetime import datetime, timedelta
 from typing import Dict, List
+
+import pandas as pd
+import requests
 
 TIINGO_API_KEY = "34d03d1d1382e36010bdb817d2512a4bfa5585f3"
 TIINGO_HEADERS = {
@@ -33,13 +35,33 @@ def _pace():
     _last_request_ts = time.time()
 
 ASSET_CONFIG: Dict[str, Dict[str, str]] = {
-    "SPY": {"ticker": "spy", "start": "2021-03-12"},
-    "QQQ": {"ticker": "qqq", "start": "2021-03-12"},
-    "COPPER": {"ticker": "cper", "start": "2017-01-03"},
-    # Tiingo IEX intraday history for these proxies starts in early 2017.
-    "UUP": {"ticker": "uup", "start": "2017-01-03"},
-    "XAU": {"ticker": "gld", "start": "2017-01-03"},
-    "XAG": {"ticker": "slv", "start": "2017-01-03"},
+    "SPY": {"ticker": "spy", "source": "iex", "start": "2021-03-12"},
+    "QQQ": {"ticker": "qqq", "source": "iex", "start": "2021-03-12"},
+    "COPPER": {"ticker": "cper", "source": "iex", "start": "2017-01-03"},
+    "UUP": {"ticker": "uup", "source": "iex", "start": "2017-01-03"},
+    "XAU": {"ticker": "gld", "source": "iex", "start": "2017-01-03"},
+    "XAG": {"ticker": "slv", "source": "iex", "start": "2017-01-03"},
+    "PAXG": {"ticker": "paxgusd", "source": "crypto", "start": "2021-03-30"},
+    "XAUT": {"ticker": "xautusd", "source": "crypto", "start": "2021-03-30"},
+    # Tiingo does not expose spot platinum/palladium directly via IEX; use liquid ETF proxies.
+    "XPT": {"ticker": "pplt", "source": "iex", "start": "2021-03-30"},
+    "BTC": {"ticker": "btcusd", "source": "crypto", "start": "2021-03-30"},
+    "XPD": {"ticker": "pall", "source": "iex", "start": "2021-03-30"},
+    "EWJ": {"ticker": "ewj", "source": "iex", "start": "2021-03-30"},
+    "EWY": {"ticker": "ewy", "source": "iex", "start": "2021-03-30"},
+    "ETH": {"ticker": "ethusd", "source": "crypto", "start": "2021-03-30"},
+    "SOL": {"ticker": "solusd", "source": "crypto", "start": "2021-03-30"},
+    "GOOGL": {"ticker": "googl", "source": "iex", "start": "2021-03-30"},
+    "INTC": {"ticker": "intc", "source": "iex", "start": "2021-03-30"},
+    "NVDA": {"ticker": "nvda", "source": "iex", "start": "2021-03-30"},
+    "TSLA": {"ticker": "tsla", "source": "iex", "start": "2021-03-30"},
+    "AMZN": {"ticker": "amzn", "source": "iex", "start": "2021-03-30"},
+    "PLTR": {"ticker": "pltr", "source": "iex", "start": "2021-03-30"},
+    "META": {"ticker": "meta", "source": "iex", "start": "2021-03-30"},
+    "MSTR": {"ticker": "mstr", "source": "iex", "start": "2021-03-30"},
+    "CRCL": {"ticker": "crcl", "source": "iex", "start": "2021-03-30"},
+    "HOOD": {"ticker": "hood", "source": "iex", "start": "2021-03-30"},
+    "COIN": {"ticker": "coin", "source": "iex", "start": "2021-03-30"},
 }
 
 
@@ -99,10 +121,33 @@ def _fetch_iex_chunk(ticker: str, start_date: date_type, end_date: date_type, de
     return left + right
 
 
+def _fetch_crypto_chunk(ticker: str, start_date: date_type, end_date: date_type):
+    url = f"{TIINGO_BASE}/tiingo/crypto/prices"
+    params = {
+        "tickers": ticker,
+        "startDate": f"{start_date.isoformat()}T00:00:00Z",
+        "endDate": f"{end_date.isoformat()}T23:59:59Z",
+        "resampleFreq": "5min",
+    }
+    data = _tiingo_get(url, params)
+    if data is None:
+        raise RuntimeError(f"Request failed for {ticker} {start_date} -> {end_date}")
+    rows = []
+    if not isinstance(data, list):
+        return rows
+    for entry in data:
+        price_data = entry.get("priceData", [])
+        if isinstance(price_data, list):
+            rows.extend(price_data)
+    return rows
+
+
 def fetch_iex_5m(ticker: str, start_date: date_type, end_date: date_type):
     """Fetch 5-minute bars from Tiingo IEX while automatically splitting capped ranges."""
     all_rows = []
     chunk_start = start_date
+    # This value has proven small enough to stay under Tiingo's 10k row cap for
+    # active IEX names without triggering recursive split requests.
     chunk_size = timedelta(days=150)
     total_chunks = ((end_date - start_date).days // chunk_size.days) + 1
     n = 0
@@ -144,6 +189,64 @@ def fetch_iex_5m(ticker: str, start_date: date_type, end_date: date_type):
     return df
 
 
+def fetch_crypto_5m(ticker: str, start_date: date_type, end_date: date_type):
+    """Fetch 5-minute bars from Tiingo crypto in 180-day chunks."""
+    all_rows = []
+    chunk_start = start_date
+    chunk_size = timedelta(days=180)
+    total_chunks = ((end_date - start_date).days // chunk_size.days) + 1
+    n = 0
+
+    while chunk_start <= end_date:
+        chunk_end = min(chunk_start + chunk_size, end_date)
+        n += 1
+        print(f"  [{n}/{total_chunks}]", end="", flush=True)
+        data = _fetch_crypto_chunk(ticker, chunk_start, chunk_end)
+        if data:
+            all_rows.extend(data)
+            print(f" +{len(data)} rows", end="", flush=True)
+        else:
+            print(" +0", end="", flush=True)
+        chunk_start = chunk_end + timedelta(days=1)
+        time.sleep(1)
+
+    if not all_rows:
+        return None
+
+    df = pd.DataFrame(all_rows)
+    col_map = {
+        "date": "time_str",
+        "open": "o",
+        "high": "h",
+        "low": "l",
+        "close": "c",
+        "volume": "v",
+        "tradesDone": "v_trades",
+        "volumeNotional": "v_notional",
+    }
+    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+    if "time_str" not in df.columns:
+        print(f"\n  No date column found. Columns: {list(df.columns)}")
+        return None
+
+    if "v" not in df.columns:
+        if "v_notional" in df.columns:
+            df["v"] = df["v_notional"]
+        elif "v_trades" in df.columns:
+            df["v"] = df["v_trades"]
+        else:
+            df["v"] = 0.0
+
+    df["time"] = pd.to_datetime(df["time_str"], utc=True)
+    df["ts"] = df["time"].astype("int64") // 10**6
+    df = df[["o", "h", "l", "c", "v", "time", "ts"]].copy()
+    df = df.dropna(subset=["o", "h", "l", "c"])
+    df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
+    df = df[(df["o"] > 0) | (df["c"] > 0)].reset_index(drop=True)
+    return df
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -155,6 +258,12 @@ def parse_args():
         "--end-date",
         default=datetime.now().date().isoformat(),
         help="End date in YYYY-MM-DD format. Defaults to today.",
+    )
+    parser.add_argument(
+        "--request-gap-sec",
+        type=float,
+        default=REQUEST_GAP_SEC,
+        help="Seconds to wait between Tiingo requests. Lower values are faster but may trigger rate limiting.",
     )
     return parser.parse_args()
 
@@ -183,6 +292,8 @@ def resolve_labels(raw_labels: List[str]) -> List[str]:
 
 def main():
     args = parse_args()
+    global REQUEST_GAP_SEC
+    REQUEST_GAP_SEC = max(0.0, float(args.request_gap_sec))
     end = date_type.fromisoformat(args.end_date)
     labels = resolve_labels(args.labels)
 
@@ -191,13 +302,17 @@ def main():
     for label in labels:
         cfg = ASSET_CONFIG[label]
         ticker = cfg["ticker"]
+        source = cfg["source"]
         start = date_type.fromisoformat(cfg["start"])
         out_path = os.path.join(CACHE_DIR, f"{label}_5m.parquet")
         print(f"\n{'='*60}")
-        print(f"Downloading {label} ({ticker}) 5m data: {start} -> {end}")
+        print(f"Downloading {label} ({ticker}, {source}) 5m data: {start} -> {end}")
         print(f"{'='*60}")
 
-        df = fetch_iex_5m(ticker, start, end)
+        if source == "crypto":
+            df = fetch_crypto_5m(ticker, start, end)
+        else:
+            df = fetch_iex_5m(ticker, start, end)
 
         if df is not None and len(df) > 0:
             df.to_parquet(out_path, index=False)
