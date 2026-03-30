@@ -1,0 +1,12 @@
+
+============================================================
+Downloading XPT (pplt, iex) 5m data: 2021-03-30 -> 2026-03-30
+============================================================
+  [1/6]
+    chunk capped at 10000 rows, splitting 2021-03-30 -> 2022-03-30
+
+  Pacing requests for 0m17s...
+
+    chunk capped at 10000 rows, splitting 2021-03-30 -> 2021-09-28
+
+  Pacing requests for 0m18s...
