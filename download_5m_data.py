@@ -38,9 +38,13 @@ ASSET_CONFIG: Dict[str, Dict[str, str]] = {
     "SPY": {"ticker": "spy", "source": "iex", "start": "2021-03-12"},
     "QQQ": {"ticker": "qqq", "source": "iex", "start": "2021-03-12"},
     "COPPER": {"ticker": "cper", "source": "iex", "start": "2017-01-03"},
+    # Tiingo IEX does not expose Brent futures directly; use the liquid Brent ETF proxy.
+    "BRENT": {"ticker": "bno", "source": "iex", "start": "2021-03-30"},
     "UUP": {"ticker": "uup", "source": "iex", "start": "2017-01-03"},
     "XAU": {"ticker": "gld", "source": "iex", "start": "2017-01-03"},
     "XAG": {"ticker": "slv", "source": "iex", "start": "2017-01-03"},
+    # Tiingo IEX does not expose front-month nat gas futures directly; use the liquid ETF proxy.
+    "NATGAS": {"ticker": "ung", "source": "iex", "start": "2021-03-30"},
     "PAXG": {"ticker": "paxgusd", "source": "crypto", "start": "2021-03-30"},
     "XAUT": {"ticker": "xautusd", "source": "crypto", "start": "2021-03-30"},
     # Tiingo does not expose spot platinum/palladium directly via IEX; use liquid ETF proxies.
