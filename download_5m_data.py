@@ -6,7 +6,7 @@ import os
 import time
 from datetime import date as date_type
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
@@ -37,6 +37,8 @@ def _pace():
 ASSET_CONFIG: Dict[str, Dict[str, str]] = {
     "SPY": {"ticker": "spy", "source": "iex", "start": "2021-03-12"},
     "QQQ": {"ticker": "qqq", "source": "iex", "start": "2021-03-12"},
+    "AAPL": {"ticker": "aapl", "source": "iex", "start": "2021-03-12"},
+    "TSM": {"ticker": "tsm", "source": "iex", "start": "2021-03-12"},
     "COPPER": {"ticker": "cper", "source": "iex", "start": "2017-01-03"},
     "UUP": {"ticker": "uup", "source": "iex", "start": "2017-01-03"},
     "XAU": {"ticker": "gld", "source": "iex", "start": "2017-01-03"},
@@ -63,6 +65,11 @@ ASSET_CONFIG: Dict[str, Dict[str, str]] = {
     "CRCL": {"ticker": "crcl", "source": "iex", "start": "2025-06-05"},
     "HOOD": {"ticker": "hood", "source": "iex", "start": "2021-03-30"},
     "COIN": {"ticker": "coin", "source": "iex", "start": "2021-03-30"},
+}
+
+LABEL_ALIASES = {
+    "APPL": "AAPL",
+    "TSMU": "TSM",
 }
 
 
@@ -274,6 +281,42 @@ def parse_args():
     return parser.parse_args()
 
 
+def _load_existing_cache(path: str) -> Optional[pd.DataFrame]:
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_parquet(path)
+    except Exception as exc:
+        print(f"\n  Failed to read existing cache {path}: {exc}", flush=True)
+        return None
+
+    if "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+    elif "ts" in df.columns:
+        df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    else:
+        print(f"\n  Existing cache at {path} is missing both 'time' and 'ts'; ignoring it.", flush=True)
+        return None
+
+    if "ts" not in df.columns:
+        df["ts"] = df["time"].astype("int64") // 10**6
+
+    return df.sort_values("ts").drop_duplicates("ts").reset_index(drop=True)
+
+
+def _merge_cache(existing_df: Optional[pd.DataFrame], new_df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    if existing_df is None or len(existing_df) == 0:
+        return new_df
+    if new_df is None or len(new_df) == 0:
+        return existing_df
+
+    combined = pd.concat([existing_df, new_df], ignore_index=True)
+    combined["time"] = pd.to_datetime(combined["time"], utc=True)
+    combined["ts"] = combined["time"].astype("int64") // 10**6
+    combined = combined.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
+    return combined
+
+
 def resolve_labels(raw_labels: List[str]) -> List[str]:
     if not raw_labels:
         return list(ASSET_CONFIG.keys())
@@ -282,8 +325,12 @@ def resolve_labels(raw_labels: List[str]) -> List[str]:
     unknown = []
     for label in raw_labels:
         label_norm = label.upper()
-        if label_norm in ASSET_CONFIG:
-            labels.append(label_norm)
+        canonical = LABEL_ALIASES.get(label_norm, label_norm)
+        if canonical in ASSET_CONFIG:
+            if label_norm != canonical:
+                print(f"Normalizing {label_norm} -> {canonical}", flush=True)
+            if canonical not in labels:
+                labels.append(canonical)
         else:
             unknown.append(label)
 
@@ -314,20 +361,37 @@ def main():
         if args.skip_existing and os.path.exists(out_path):
             print(f"\nSkipping {label}: cache already exists at {out_path}")
             continue
+
+        existing_df = _load_existing_cache(out_path)
+        fetch_start = start
+        if existing_df is not None and len(existing_df) > 0:
+            cached_start = existing_df["time"].min()
+            cached_end = existing_df["time"].max()
+            print(f"\nExisting cache for {label}: {cached_start} -> {cached_end} ({len(existing_df)} rows)")
+            cached_end_date = cached_end.date()
+            if cached_end_date >= end:
+                print(f"  Cache already covers requested end date {end}; no Tiingo call needed.")
+                continue
+            fetch_start = cached_end_date + timedelta(days=1)
+            print(f"  Fetching missing tail only: {fetch_start} -> {end}")
+
         print(f"\n{'='*60}")
-        print(f"Downloading {label} ({ticker}, {source}) 5m data: {start} -> {end}")
+        print(f"Downloading {label} ({ticker}, {source}) 5m data: {fetch_start} -> {end}")
         print(f"{'='*60}")
 
         if source == "crypto":
-            df = fetch_crypto_5m(ticker, start, end)
+            df = fetch_crypto_5m(ticker, fetch_start, end)
         else:
-            df = fetch_iex_5m(ticker, start, end)
+            df = fetch_iex_5m(ticker, fetch_start, end)
 
-        if df is not None and len(df) > 0:
-            df.to_parquet(out_path, index=False)
-            print(f"\n  Saved {len(df)} rows to {out_path}")
-            print(f"  Date range: {df['time'].min()} -> {df['time'].max()}")
-            print(f"  Columns: {list(df.columns)}")
+        merged_df = _merge_cache(existing_df, df)
+
+        if merged_df is not None and len(merged_df) > 0:
+            merged_df.to_parquet(out_path, index=False)
+            added_rows = 0 if df is None else len(df)
+            print(f"\n  Saved {len(merged_df)} rows to {out_path} (+{added_rows} fetched)")
+            print(f"  Date range: {merged_df['time'].min()} -> {merged_df['time'].max()}")
+            print(f"  Columns: {list(merged_df.columns)}")
         else:
             print(f"\n  NO DATA returned for {label}")
 

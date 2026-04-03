@@ -135,7 +135,11 @@ VARIANTS = [
 # ====================================================================
 ASSETS = [
     # US Equities (Tiingo IEX)
+    dict(label="SPY",  tiingo_sym="spy",   source="iex", tier=1),
+    dict(label="QQQ",  tiingo_sym="qqq",   source="iex", tier=1),
+    dict(label="AAPL", tiingo_sym="aapl",  source="iex", tier=1),
     dict(label="TSLA", tiingo_sym="tsla",  source="iex", tier=1),
+    dict(label="TSM",  tiingo_sym="tsm",   source="iex", tier=1),
     dict(label="COIN", tiingo_sym="coin",  source="iex", tier=1),
     dict(label="HOOD", tiingo_sym="hood",  source="iex", tier=1),
     dict(label="MSTR", tiingo_sym="mstr",  source="iex", tier=1),
@@ -150,7 +154,9 @@ ASSETS = [
 ]
 
 ASSET_CLASS = {
-    "TSLA": "equity", "COIN": "equity", "HOOD": "equity", "MSTR": "equity",
+    "SPY": "equity", "QQQ": "equity", "AAPL": "equity", "TSLA": "equity",
+    "TSM": "equity", "COIN": "equity",
+    "HOOD": "equity", "MSTR": "equity",
     "AMZN": "equity", "PLTR": "equity", "INTC": "equity",
     "XAU":  "metals", "XAG":  "metals",
     "SOL":  "crypto",
@@ -1879,7 +1885,7 @@ def main():
     print("  Periods: 1Y, 3Y, 5Y backtest comparison")
     print("  Data: Tiingo IEX (stocks/ETFs) + Tiingo Crypto (SOL)")
     print("  Param sets: S9 | S10 | S12")
-    print("  Assets: TSLA AMZN PLTR INTC HOOD COIN MSTR | XAU(GLD) XAG(SLV) | SOL")
+    print("  Assets: SPY QQQ AAPL TSLA TSM AMZN PLTR INTC HOOD COIN MSTR | XAU(GLD) XAG(SLV) | SOL")
     bar()
     print()
 
