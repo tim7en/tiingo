@@ -1,5 +1,5 @@
 {
-  "downloaded_at_utc": "2026-04-07T09:34:38.473213+00:00",
+  "downloaded_at_utc": "2026-04-07T14:10:14.828964+00:00",
   "start": "1999-01-01",
   "end": "2026-04-07",
   "files": {
@@ -45,11 +45,34 @@
       "combined_col": "wti_usd_per_bbl",
       "source": "FRED",
       "source_url": "https://fred.stlouisfed.org/series/DCOILWTICO"
+    },
+    "CPI": {
+      "series_id": "CPIAUCSL",
+      "name": "Consumer Price Index for All Urban Consumers: All Items in U.S. City Average",
+      "units": "index 1982-1984=100, seasonally adjusted",
+      "combined_col": "cpi_all_items_index",
+      "derived": "cpi_inflation",
+      "derived_combined_cols": {
+        "cpi_mom_pct": "cpi_mom_pct",
+        "cpi_yoy_pct": "cpi_yoy_pct"
+      },
+      "source": "FRED",
+      "source_url": "https://fred.stlouisfed.org/series/CPIAUCSL"
+    },
+    "UNRATE": {
+      "series_id": "UNRATE",
+      "name": "Unemployment Rate",
+      "units": "percent, seasonally adjusted",
+      "combined_col": "unemployment_rate_pct",
+      "source": "FRED",
+      "source_url": "https://fred.stlouisfed.org/series/UNRATE"
     }
   },
   "notes": [
     "Combined table uses an outer join on date and does not forward-fill missing observations.",
     "Rows with no values in any combined data column are dropped from the combined table.",
-    "Treasury yields are percent; WTI is USD per barrel."
+    "Treasury yields, CPI inflation, and unemployment are percent; WTI is USD per barrel.",
+    "CPI and unemployment are monthly FRED observations and are not forward-filled.",
+    "CPI month-over-month and year-over-year inflation percentages are computed from CPIAUCSL."
   ]
 }

@@ -5,6 +5,8 @@ Series:
 - DXY: Yahoo Finance chart data for DX-Y.NYB (ICE U.S. Dollar Index)
 - US2Y/US10Y/US30Y: FRED Treasury constant maturity yields
 - WTI: FRED WTI Cushing crude oil spot price
+- CPI: FRED CPIAUCSL with derived month-over-month and year-over-year inflation
+- UNRATE: FRED civilian unemployment rate
 """
 
 from __future__ import annotations
@@ -48,6 +50,23 @@ FRED_SERIES = {
         "name": "WTI Crude Oil Spot Price, Cushing, OK",
         "units": "USD per barrel",
         "combined_col": "wti_usd_per_bbl",
+    },
+    "CPI": {
+        "series_id": "CPIAUCSL",
+        "name": "Consumer Price Index for All Urban Consumers: All Items in U.S. City Average",
+        "units": "index 1982-1984=100, seasonally adjusted",
+        "combined_col": "cpi_all_items_index",
+        "derived": "cpi_inflation",
+        "derived_combined_cols": {
+            "cpi_mom_pct": "cpi_mom_pct",
+            "cpi_yoy_pct": "cpi_yoy_pct",
+        },
+    },
+    "UNRATE": {
+        "series_id": "UNRATE",
+        "name": "Unemployment Rate",
+        "units": "percent, seasonally adjusted",
+        "combined_col": "unemployment_rate_pct",
     },
 }
 
@@ -107,7 +126,7 @@ def request_text(
 def fetch_fred_series(
     session: requests.Session,
     label: str,
-    config: dict[str, str],
+    config: dict[str, Any],
     start_date: date,
     end_date: date,
 ) -> pd.DataFrame:
@@ -120,12 +139,19 @@ def fetch_fred_series(
     df = df.rename(columns={"observation_date": "date", series_id: "value"})
     df["date"] = pd.to_datetime(df["date"]).dt.date
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.sort_values("date").reset_index(drop=True)
+    if config.get("derived") == "cpi_inflation":
+        df["cpi_mom_pct"] = df["value"].pct_change(periods=1, fill_method=None) * 100.0
+        df["cpi_yoy_pct"] = df["value"].pct_change(periods=12, fill_method=None) * 100.0
     df = df[(df["date"] >= start_date) & (df["date"] <= end_date)].copy()
     df["series_id"] = series_id
     df["label"] = label
     df["name"] = config["name"]
     df["units"] = config["units"]
-    return df[["date", "value", "series_id", "label", "name", "units"]].reset_index(drop=True)
+    output_cols = ["date", "value"]
+    output_cols.extend((config.get("derived_combined_cols") or {}).keys())
+    output_cols.extend(["series_id", "label", "name", "units"])
+    return df[output_cols].reset_index(drop=True)
 
 
 def fetch_dxy(session: requests.Session, start_date: date, end_date: date) -> pd.DataFrame:
@@ -217,8 +243,11 @@ def main() -> None:
         fred_df = fetch_fred_series(session, label, config, start_date, end_date)
         save_table(fred_df, os.path.join(args.cache_dir, f"{label}_daily"))
         print_range(label, fred_df, "value")
+        derived_cols = config.get("derived_combined_cols") or {}
+        fred_combined_cols = ["date", "value", *derived_cols.keys()]
+        fred_rename = {"value": config["combined_col"], **derived_cols}
         combined = combined.merge(
-            fred_df[["date", "value"]].rename(columns={"value": config["combined_col"]}),
+            fred_df[fred_combined_cols].rename(columns=fred_rename),
             on="date",
             how="outer",
         )
@@ -229,7 +258,10 @@ def main() -> None:
         }
 
     combined = combined.sort_values("date").reset_index(drop=True)
-    value_columns = ["dxy_close"] + [config["combined_col"] for config in FRED_SERIES.values()]
+    value_columns = ["dxy_close"]
+    for config in FRED_SERIES.values():
+        value_columns.append(config["combined_col"])
+        value_columns.extend((config.get("derived_combined_cols") or {}).values())
     combined = combined.dropna(subset=value_columns, how="all").reset_index(drop=True)
     save_table(combined, os.path.join(args.cache_dir, "macro_daily_1999"))
     print_range("combined", combined, "dxy_close")
@@ -246,7 +278,9 @@ def main() -> None:
         "notes": [
             "Combined table uses an outer join on date and does not forward-fill missing observations.",
             "Rows with no values in any combined data column are dropped from the combined table.",
-            "Treasury yields are percent; WTI is USD per barrel.",
+            "Treasury yields, CPI inflation, and unemployment are percent; WTI is USD per barrel.",
+            "CPI and unemployment are monthly FRED observations and are not forward-filled.",
+            "CPI month-over-month and year-over-year inflation percentages are computed from CPIAUCSL.",
         ],
     }
     with open(os.path.join(args.cache_dir, "macro_daily_1999_metadata.json"), "w", encoding="utf-8") as fh:
