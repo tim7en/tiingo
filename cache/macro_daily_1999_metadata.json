@@ -1,0 +1,55 @@
+{
+  "downloaded_at_utc": "2026-04-07T09:34:38.473213+00:00",
+  "start": "1999-01-01",
+  "end": "2026-04-07",
+  "files": {
+    "combined_csv": "D:\\tiingo\\cache\\macro_daily_1999.csv",
+    "combined_parquet": "D:\\tiingo\\cache\\macro_daily_1999.parquet"
+  },
+  "series": {
+    "DXY": {
+      "ticker": "DX-Y.NYB",
+      "source": "Yahoo Finance chart API",
+      "source_url": "https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB",
+      "combined_col": "dxy_close",
+      "units": "index level"
+    },
+    "US2Y": {
+      "series_id": "DGS2",
+      "name": "2-Year Treasury Constant Maturity Rate",
+      "units": "percent",
+      "combined_col": "us_2y_yield",
+      "source": "FRED",
+      "source_url": "https://fred.stlouisfed.org/series/DGS2"
+    },
+    "US10Y": {
+      "series_id": "DGS10",
+      "name": "10-Year Treasury Constant Maturity Rate",
+      "units": "percent",
+      "combined_col": "us_10y_yield",
+      "source": "FRED",
+      "source_url": "https://fred.stlouisfed.org/series/DGS10"
+    },
+    "US30Y": {
+      "series_id": "DGS30",
+      "name": "30-Year Treasury Constant Maturity Rate",
+      "units": "percent",
+      "combined_col": "us_30y_yield",
+      "source": "FRED",
+      "source_url": "https://fred.stlouisfed.org/series/DGS30"
+    },
+    "WTI": {
+      "series_id": "DCOILWTICO",
+      "name": "WTI Crude Oil Spot Price, Cushing, OK",
+      "units": "USD per barrel",
+      "combined_col": "wti_usd_per_bbl",
+      "source": "FRED",
+      "source_url": "https://fred.stlouisfed.org/series/DCOILWTICO"
+    }
+  },
+  "notes": [
+    "Combined table uses an outer join on date and does not forward-fill missing observations.",
+    "Rows with no values in any combined data column are dropped from the combined table.",
+    "Treasury yields are percent; WTI is USD per barrel."
+  ]
+}
